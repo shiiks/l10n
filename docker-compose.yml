@@ -1,0 +1,7 @@
+services:
+  l10n:
+    build: .
+    image: l10n:local
+    ports:
+      - "8000:80"
+    restart: unless-stopped

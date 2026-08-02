@@ -35,13 +35,33 @@ A zero-build, zero-backend static page:
 
 ### Run it
 
+**With Docker (recommended — platform independent, no dependencies):**
+
+```bash
+docker compose up
+# or without compose:
+docker build -t l10n . && docker run -p 8000:80 l10n
+# open http://localhost:8000 in Chrome or Edge
+```
+
+The image is based on `nginx:alpine` and builds for amd64 and arm64, so it runs
+the same on Linux servers, Windows/macOS (Docker Desktop), Apple Silicon, and
+Raspberry Pi class devices. Once CI publishes to GitHub Container Registry
+(on pushes to `main`), anyone can run it without cloning:
+
+```bash
+docker run -p 8000:80 ghcr.io/shiiks/l10n:latest
+```
+
+**Without Docker** — it's a static page, any file server works:
+
 ```bash
 cd web
 python3 -m http.server 8000
 # open http://localhost:8000 in Chrome or Edge
 ```
 
-Any static file server works. The Web Speech API requires a secure context:
+The Web Speech API requires a secure context:
 `localhost` counts, but to test **on your phone** you need HTTPS — easiest
 options are GitHub Pages, `npx serve` behind a tunnel (e.g. `cloudflared`,
 `ngrok`), or Tailscale HTTPS.
