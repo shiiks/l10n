@@ -139,7 +139,7 @@ const el = {
   settingsBtn: $('settingsBtn'), settingsDialog: $('settingsDialog'),
   providerSelect: $('providerSelect'), apiKeyInput: $('apiKeyInput'),
   voiceSelect: $('voiceSelect'), settingsSave: $('settingsSave'),
-  settingsClose: $('settingsClose'),
+  settingsClose: $('settingsClose'), voiceTest: $('voiceTest'),
 };
 
 function setStatus(text) { el.status.textContent = text; }
@@ -253,6 +253,7 @@ function updateMicButton() {
 }
 
 el.micBtn.addEventListener('click', () => {
+  unlockTTS(); // user gesture — unlock speech output for later programmatic use
   state.listening = !state.listening;
   updateMicButton();
   if (state.listening) startEngine();
@@ -330,6 +331,12 @@ function refreshVoices() {
     if (v.voiceURI === current) opt.selected = true;
     el.voiceSelect.appendChild(opt);
   }
+  const hint = document.getElementById('voiceCountHint');
+  if (hint) {
+    hint.textContent = voices.length
+      ? `${voices.length} speech voices available in this browser.`
+      : '⚠ No speech voices available — this browser/OS cannot speak. On Linux install speech-dispatcher, or use Chrome on Windows/macOS/Android.';
+  }
 }
 refreshVoices();
 if ('onvoiceschanged' in speechSynthesis) speechSynthesis.onvoiceschanged = refreshVoices;
@@ -348,29 +355,80 @@ function pickVoice(tgtCode) {
   );
 }
 
+const IS_ANDROID = /Android/i.test(navigator.userAgent);
+let keepaliveTimer = null;
+let missingVoiceWarned = false;
+
+/**
+ * Desktop Chrome halts long utterances after ~15 s unless nudged with
+ * pause()/resume(). The same trick kills audio on Android, so desktop only.
+ */
+function startKeepalive() {
+  if (IS_ANDROID) return;
+  clearInterval(keepaliveTimer);
+  keepaliveTimer = setInterval(() => {
+    if (!speechSynthesis.speaking) { clearInterval(keepaliveTimer); return; }
+    speechSynthesis.pause();
+    speechSynthesis.resume();
+  }, 10000);
+}
+
+function finishSpeaking() {
+  if (speechSynthesis.speaking || speechSynthesis.pending) return; // queue continues
+  state.speaking = false;
+  clearInterval(keepaliveTimer);
+  if (state.listening && !state.recognizing) {
+    setTimeout(() => { if (state.listening && !state.recognizing) startEngine(); }, 200);
+  } else if (!state.listening) {
+    setStatus('Idle');
+  }
+}
+
 function speak(text) {
-  const utterance = new SpeechSynthesisUtterance(text);
   const tgt = el.tgtLang.value;
+  const utterance = new SpeechSynthesisUtterance(text);
   utterance.lang = langByCode(tgt)?.bcp47 || tgt;
   const voice = pickVoice(tgt);
-  if (voice) utterance.voice = voice;
+  if (voice) {
+    utterance.voice = voice;
+  } else if (!missingVoiceWarned) {
+    missingVoiceWarned = true;
+    const name = langByCode(tgt)?.name || tgt;
+    appendLine(el.tgtFinal, `⚠ No ${name} voice installed in this browser — trying the system default. Pick a voice in ⚙ Settings.`, true);
+  }
 
-  utterance.onstart = () => {
-    state.speaking = true;
-    // Ducking: stop the mic while we speak so the app doesn't translate itself
-    // when audio comes out of open speakers. With earbuds this is optional.
-    if (el.duckToggle.checked && state.recognizing) stopEngine();
-    setStatus('Speaking…');
-  };
-  utterance.onend = utterance.onerror = () => {
-    state.speaking = false;
-    if (!speechSynthesis.pending && state.listening && !state.recognizing) {
-      setTimeout(() => { if (state.listening && !state.recognizing) startEngine(); }, 200);
+  // Release the mic BEFORE speaking: while recognition holds the audio
+  // session (notably Chrome on Android), TTS is silently discarded and
+  // onstart never fires. state.speaking is set synchronously so the
+  // recognizer's onend handler doesn't immediately restart the mic.
+  state.speaking = true;
+  if (el.duckToggle.checked && state.recognizing) stopEngine();
+
+  utterance.onstart = () => setStatus('Speaking…');
+  utterance.onend = finishSpeaking;
+  utterance.onerror = (event) => {
+    if (event.error !== 'interrupted' && event.error !== 'canceled') {
+      appendLine(el.tgtFinal, `⚠ Speech output failed: ${event.error}`, true);
+      setStatus(`TTS error: ${event.error}`);
     }
-    if (!state.listening) setStatus('Idle');
+    finishSpeaking();
   };
 
+  speechSynthesis.resume(); // Chrome can be stuck in a paused state
   speechSynthesis.speak(utterance); // queues if something is already playing
+  startKeepalive();
+}
+
+/**
+ * Browsers require speak() inside a user gesture at least once before
+ * allowing programmatic speech. The mic button click is that gesture.
+ */
+let ttsUnlocked = false;
+function unlockTTS() {
+  if (ttsUnlocked) return;
+  ttsUnlocked = true;
+  speechSynthesis.resume();
+  speechSynthesis.speak(new SpeechSynthesisUtterance(''));
 }
 
 // ---------------------------------------------------------------------------
@@ -394,5 +452,15 @@ el.settingsSave.addEventListener('click', () => {
 });
 
 el.settingsClose.addEventListener('click', () => el.settingsDialog.close());
+
+el.voiceTest.addEventListener('click', () => {
+  // Use the dialog's current (unsaved) selection so voices can be auditioned.
+  const prev = settings.voiceURI;
+  settings.voiceURI = el.voiceSelect.value;
+  missingVoiceWarned = false;
+  ttsUnlocked = true; // this click is itself the unlocking gesture
+  speak('Testing, one two three.');
+  settings.voiceURI = prev;
+});
 
 updateMicButton();
