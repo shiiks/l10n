@@ -6,6 +6,29 @@ you speak in one language, the listener hears it in another, in near real time.
 The strategy is **software first**: prove the experience with a plain web app and
 ordinary Bluetooth earbuds, then decide what (if anything) needs custom hardware.
 
+## Quick start
+
+```bash
+./run.sh              # → open http://localhost:8000 in Chrome/Edge
+```
+
+Testing **on your phone with earbuds** (the mic needs HTTPS, so localhost
+isn't enough from another device):
+
+```bash
+./run.sh --tunnel     # → open the https://…trycloudflare.com URL from the log
+```
+
+Then: connect earbuds → pick languages → **Start listening** → speak.
+The translation appears live and is spoken into your ears. Use
+⚙ Settings → **🔊 Test voice** first to confirm audio output works.
+
+`run.sh` uses Docker if available and falls back to `python3 -m http.server`
+otherwise. On Windows without WSL, run `docker compose up` directly.
+Once merged to `main`, the app also auto-deploys to GitHub Pages
+(enable Pages → Source: *GitHub Actions* in repo settings once), so it's
+permanently testable at `https://shiiks.github.io/l10n/` with zero setup.
+
 ## Roadmap
 
 | Phase | Goal | Status |

@@ -3,5 +3,17 @@ services:
     build: .
     image: l10n:local
     ports:
-      - "8000:80"
+      - "${PORT:-8000}:80"
     restart: unless-stopped
+
+  # Optional: free public HTTPS URL for testing on your phone (mic access
+  # requires a secure context). Start with: docker compose --profile tunnel up
+  # The URL appears in this service's logs as https://<random>.trycloudflare.com
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --url http://l10n:80
+    depends_on:
+      - l10n
+    restart: unless-stopped
+    profiles:
+      - tunnel
