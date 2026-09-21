@@ -26,6 +26,12 @@
       <button class="tab" data-source="tab">🖥 Browser tab</button>
     </nav>
 
+    <section class="mode-row" id="modeRow">
+      <button class="mode active" data-mode="chunked">Chunked pipeline (free)</button>
+      <button class="mode" data-mode="realtime">⚡ Realtime speech-to-speech (Gemini Live)</button>
+      <span class="hint" id="modeHint"></span>
+    </section>
+
     <section class="lang-row">
       <label class="lang-select">
         <span>Source language</span>
@@ -47,7 +53,7 @@
       <div class="media-controls">
         <input type="file" id="fileInput" accept="audio/*,video/*" class="file-only" />
         <button id="shareTabBtn" class="tab-only">🖥 Share a tab with audio</button>
-        <label class="lang-select engine-select">
+        <label class="lang-select engine-select chunked-only">
           <span>Speech-to-text engine</span>
           <select id="engineSelect">
             <option value="Xenova/whisper-tiny">Whisper tiny — in browser, fastest</option>
@@ -123,6 +129,7 @@
     </dialog>
   </main>
   <script src="media.js"></script>
+  <script src="realtime.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -75,6 +75,29 @@ body:not([data-source="mic"]) .mic-only,
 body:not([data-source="file"]) .file-only,
 body:not([data-source="tab"]) .tab-only { display: none !important; }
 
+/* Pipeline mode: chunked (STT → MT → TTS) vs realtime speech-to-speech */
+.mode-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.mode {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 0.35rem 0.75rem;
+  font-size: 0.85rem;
+  border-radius: 999px;
+}
+
+.mode.active { color: var(--text); border-color: var(--accent); background: var(--panel-2); }
+
+.mode-row .hint { flex-basis: 100%; margin: 0; }
+
+body[data-mode="realtime"] .chunked-only { display: none !important; }
+
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);

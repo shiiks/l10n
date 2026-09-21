@@ -113,6 +113,7 @@ function translationPrompt(text, src, tgt) {
 // State & settings
 // ---------------------------------------------------------------------------
 const settings = {
+  mode: localStorage.getItem('l10n.mode') || 'chunked', // 'chunked' | 'realtime'
   provider: localStorage.getItem('l10n.provider') || 'free',
   apiKey: localStorage.getItem('l10n.apiKey') || '',
   voiceURI: localStorage.getItem('l10n.voiceURI') || '',
@@ -148,6 +149,7 @@ const el = {
   muteOriginal: $('muteOriginal'), engineProgress: $('engineProgress'),
   engineProgressBar: $('engineProgressBar'), engineProgressText: $('engineProgressText'),
   mediaVideo: $('mediaVideo'), subtitle: $('subtitle'),
+  modeRow: $('modeRow'), modeHint: $('modeHint'),
 };
 
 function setStatus(text) { el.status.textContent = text; }
@@ -172,7 +174,8 @@ populateLangSelect(el.tgtLang, localStorage.getItem('l10n.tgt') || 'hi');
 function onLangChange() {
   localStorage.setItem('l10n.src', el.srcLang.value);
   localStorage.setItem('l10n.tgt', el.tgtLang.value);
-  if (state.listening) restartRecognition();
+  if (isRealtime()) restartRealtime();
+  else if (state.listening) restartRecognition();
 }
 el.srcLang.addEventListener('change', onLangChange);
 el.tgtLang.addEventListener('change', onLangChange);
@@ -188,10 +191,7 @@ el.swapBtn.addEventListener('click', () => {
 // Speech recognition (streaming STT)
 // ---------------------------------------------------------------------------
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-if (!SpeechRecognition) {
-  el.banner.classList.remove('hidden');
-  el.micBtn.disabled = true;
-}
+if (!SpeechRecognition) el.banner.classList.remove('hidden');
 
 function createRecognition() {
   const rec = new SpeechRecognition();
@@ -260,10 +260,19 @@ function updateMicButton() {
   el.micBtn.classList.toggle('active', state.listening);
 }
 
-el.micBtn.addEventListener('click', () => {
+el.micBtn.addEventListener('click', async () => {
   unlockTTS(); // user gesture — unlock speech output for later programmatic use
+  if (!isRealtime() && !SpeechRecognition) {
+    appendLine(el.tgtFinal, '⚠ This browser has no speech recognition. Use Chrome/Edge, or switch to Realtime mode.', true);
+    return;
+  }
   state.listening = !state.listening;
   updateMicButton();
+  if (isRealtime()) {
+    if (state.listening) await startRealtimeMic();
+    else stopRealtimeMic();
+    return;
+  }
   if (state.listening) startEngine();
   else { stopEngine(); setStatus('Idle'); }
 });
@@ -333,14 +342,23 @@ state.media = null;        // active L10nMedia session
 state.mediaQueue = [];     // pending audio chunks awaiting transcription
 state.transcribing = false;
 
-function setSource(source) {
-  if (source === state.source) return;
-  if (state.listening) { state.listening = false; stopEngine(); updateMicButton(); }
+function teardownSources() {
+  if (state.listening) {
+    state.listening = false;
+    updateMicButton();
+    if (isRealtime()) stopRealtimeMic(); else stopEngine();
+  }
   closeMediaSession();
   if (el.mediaVideo.srcObject) {
     el.mediaVideo.srcObject.getTracks().forEach((t) => t.stop());
     el.mediaVideo.srcObject = null;
   }
+  closeRealtime();
+}
+
+function setSource(source) {
+  if (source === state.source) return;
+  teardownSources();
   state.source = source;
   document.body.dataset.source = source;
   for (const tab of el.sourceTabs.querySelectorAll('.tab')) {
@@ -435,6 +453,11 @@ function closeMediaSession() {
   el.subtitle.textContent = '';
 }
 
+/** Where captured audio goes: the chunker (chunked mode) or straight to Gemini Live. */
+function mediaSinkOpts() {
+  return isRealtime() ? { onSamples: rtSink } : { onChunk: onAudioChunk };
+}
+
 // --- Video / audio file -------------------------------------------------------
 el.fileInput.addEventListener('change', async () => {
   const file = el.fileInput.files[0];
@@ -445,10 +468,11 @@ el.fileInput.addEventListener('change', async () => {
   el.mediaVideo.src = URL.createObjectURL(file);
   el.mediaVideo.muted = false;
   try {
-    state.media = await L10nMedia.openElementSession(el.mediaVideo, { onChunk: onAudioChunk });
+    if (isRealtime()) await ensureRealtime();
+    state.media = await L10nMedia.openElementSession(el.mediaVideo, mediaSinkOpts());
     state.media.setOriginalVolume(el.muteOriginal.checked ? 0 : 1);
     setStatus('Press play to start translating');
-    loadEngine().catch(() => {}); // warm the model while the user hits play
+    if (!isRealtime()) loadEngine().catch(() => {}); // warm the model while the user hits play
   } catch (err) {
     appendLine(el.tgtFinal, `⚠ Could not capture audio: ${err.message}`, true);
   }
@@ -459,10 +483,10 @@ el.muteOriginal.addEventListener('change', () => {
 });
 
 el.mediaVideo.addEventListener('play', () => {
-  if (state.media) { state.media.resume(); setStatus('Listening to media…'); }
+  if (state.media) { state.media.resume(); setStatus(isRealtime() ? 'Live — translating media' : 'Listening to media…'); }
 });
-el.mediaVideo.addEventListener('pause', () => { if (state.media) state.media.chunker.flush(); });
-el.mediaVideo.addEventListener('ended', () => { if (state.media) state.media.chunker.flush(); });
+el.mediaVideo.addEventListener('pause', () => state.media?.chunker?.flush());
+el.mediaVideo.addEventListener('ended', () => state.media?.chunker?.flush());
 
 // --- Browser tab ---------------------------------------------------------------
 el.shareTabBtn.addEventListener('click', async () => {
@@ -488,10 +512,11 @@ el.shareTabBtn.addEventListener('click', async () => {
   el.mediaVideo.muted = true; // the tab itself is already audible
   el.mediaVideo.play().catch(() => {});
   try {
-    state.media = await L10nMedia.openStreamSession(stream, { onChunk: onAudioChunk });
+    if (isRealtime()) await ensureRealtime();
+    state.media = await L10nMedia.openStreamSession(stream, mediaSinkOpts());
     await state.media.resume();
-    setStatus('Listening to tab…');
-    loadEngine().catch(() => {});
+    setStatus(isRealtime() ? 'Live — translating tab' : 'Listening to tab…');
+    if (!isRealtime()) loadEngine().catch(() => {});
   } catch (err) {
     appendLine(el.tgtFinal, `⚠ Could not capture tab audio: ${err.message}`, true);
   }
@@ -501,6 +526,110 @@ el.shareTabBtn.addEventListener('click', async () => {
     setStatus('Tab sharing stopped');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Realtime speech-to-speech mode (phase 3): Gemini Live replaces the chain.
+// Any captured audio (mic, file, tab) streams to the model; translated speech
+// streams back and is played directly. Text input still uses the chunked
+// path because the translate model accepts audio only.
+// ---------------------------------------------------------------------------
+const isRealtime = () => settings.mode === 'realtime';
+state.rt = null;      // RealtimeTranslator
+state.rtMic = null;   // { stream, session } while the mic is live
+
+function applyMode() {
+  document.body.dataset.mode = settings.mode;
+  for (const btn of el.modeRow.querySelectorAll('.mode')) {
+    btn.classList.toggle('active', btn.dataset.mode === settings.mode);
+  }
+  el.modeHint.textContent = isRealtime()
+    ? 'One model hears audio and speaks the translation (~1 s behind, keeps your pacing and tone). Source language is detected automatically. Needs a Gemini API key in ⚙ Settings.'
+    : 'Speech-to-text → translation → text-to-speech. Works with no API key; a few seconds behind.';
+}
+
+el.modeRow.addEventListener('click', (event) => {
+  const btn = event.target.closest('.mode');
+  if (!btn || btn.dataset.mode === settings.mode) return;
+  unlockTTS();
+  teardownSources();
+  settings.mode = btn.dataset.mode;
+  localStorage.setItem('l10n.mode', settings.mode);
+  applyMode();
+});
+
+async function ensureRealtime() {
+  if (state.rt) return state.rt;
+  if (!settings.apiKey) throw new Error('Realtime mode needs a Gemini API key — add it in ⚙ Settings');
+  const rt = new RealtimeTranslator({
+    apiKey: settings.apiKey,
+    targetLang: el.tgtLang.value,
+    audioContext: L10nMedia.getAudioContext(),
+    endpoint: new URLSearchParams(location.search).get('rtEndpoint') || undefined, // test hook
+    onStatus: setStatus,
+    onInputText: (text, final) => {
+      if (final) { appendLine(el.srcFinal, text); el.srcInterim.textContent = ''; }
+      else el.srcInterim.textContent = text;
+    },
+    onOutputText: (text, final) => {
+      el.subtitle.textContent = text;
+      if (final) { appendLine(el.tgtFinal, text); el.tgtInterim.textContent = ''; }
+      else el.tgtInterim.textContent = text;
+    },
+    onError: (err) => appendLine(el.tgtFinal, `⚠ ${err.message}`, true),
+  });
+  rt.setPlayback(el.speakToggle.checked);
+  state.rt = rt;
+  try {
+    await rt.connect();
+  } catch (err) {
+    state.rt = null;
+    throw err;
+  }
+  return rt;
+}
+
+function closeRealtime() {
+  if (state.rt) { state.rt.close(); state.rt = null; }
+}
+
+const rtSink = (samples) => state.rt?.sendSamples(samples);
+
+async function startRealtimeMic() {
+  try {
+    await ensureRealtime();
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    const session = await L10nMedia.openStreamSession(stream, { onSamples: rtSink });
+    await session.resume();
+    state.rtMic = { stream, session };
+  } catch (err) {
+    appendLine(el.tgtFinal, `⚠ ${err.message}`, true);
+    state.listening = false;
+    updateMicButton();
+    closeRealtime();
+    setStatus('Idle');
+  }
+}
+
+function stopRealtimeMic() {
+  if (state.rtMic) {
+    state.rtMic.session.close();
+    state.rtMic.stream.getTracks().forEach((t) => t.stop());
+    state.rtMic = null;
+  }
+  closeRealtime();
+  setStatus('Idle');
+}
+
+/** The target language is fixed at session setup, so a change means reconnecting. */
+async function restartRealtime() {
+  if (!state.rt) return;
+  closeRealtime();
+  try { await ensureRealtime(); } catch (err) { appendLine(el.tgtFinal, `⚠ ${err.message}`, true); }
+}
+
+el.speakToggle.addEventListener('change', () => state.rt?.setPlayback(el.speakToggle.checked));
 
 // ---------------------------------------------------------------------------
 // Speech synthesis (TTS) — plays through the system's active output device.
@@ -651,3 +780,5 @@ el.voiceTest.addEventListener('click', () => {
 });
 
 updateMicButton();
+applyMode();
+window.l10nDebug = { state, settings }; // inspection hook for tests

@@ -82,15 +82,20 @@ const L10nMedia = (() => {
   }
 
   // -------------------------------------------------------------------------
-  // Sessions: wire a source node → worklet → chunker (+ optional passthrough).
+  // Sessions: wire a source node → worklet → chunker and/or raw sample sink.
+  //   opts.onChunk   (Float32Array) speech chunk cut at a pause (chunked mode)
+  //   opts.onSamples (Float32Array) every 100 ms batch as-is (realtime mode)
   // -------------------------------------------------------------------------
-  async function openSession(sourceNode, { passthrough, chunkerOpts }) {
+  async function openSession(sourceNode, { passthrough, opts }) {
     const ctx = getAudioContext();
     await ensureWorklet(ctx);
 
-    const chunker = new SpeechChunker(chunkerOpts);
+    const chunker = opts.onChunk ? new SpeechChunker(opts) : null;
     const capture = new AudioWorkletNode(ctx, 'pcm-capture');
-    capture.port.onmessage = (event) => chunker.push(event.data);
+    capture.port.onmessage = (event) => {
+      if (opts.onSamples) opts.onSamples(event.data);
+      if (chunker) chunker.push(event.data);
+    };
     sourceNode.connect(capture);
 
     let gain = null;
@@ -105,8 +110,9 @@ const L10nMedia = (() => {
       resume: () => ctx.resume(),
       setOriginalVolume(v) { if (gain) gain.gain.value = v; },
       close() {
-        chunker.flush();
+        if (chunker) chunker.flush();
         try { sourceNode.disconnect(capture); } catch (_) {}
+        if (gain) { try { sourceNode.disconnect(gain); gain.disconnect(); } catch (_) {} }
         capture.port.onmessage = null;
         capture.disconnect();
       },
@@ -116,21 +122,21 @@ const L10nMedia = (() => {
   const elementSources = new WeakMap(); // createMediaElementSource is once-per-element
 
   /** Session for a <video>/<audio> element; its audio keeps playing through `gain`. */
-  async function openElementSession(mediaEl, chunkerOpts) {
+  async function openElementSession(mediaEl, opts) {
     const ctx = getAudioContext();
     let source = elementSources.get(mediaEl);
     if (!source) {
       source = ctx.createMediaElementSource(mediaEl);
       elementSources.set(mediaEl, source);
     }
-    return openSession(source, { passthrough: true, chunkerOpts });
+    return openSession(source, { passthrough: true, opts });
   }
 
   /** Session for a MediaStream (shared tab, screen, or any getUserMedia stream). */
-  async function openStreamSession(stream, chunkerOpts) {
+  async function openStreamSession(stream, opts) {
     const ctx = getAudioContext();
     const source = ctx.createMediaStreamSource(stream);
-    return openSession(source, { passthrough: false, chunkerOpts });
+    return openSession(source, { passthrough: false, opts });
   }
 
   // -------------------------------------------------------------------------

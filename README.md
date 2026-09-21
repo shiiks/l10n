@@ -35,7 +35,7 @@ permanently testable at `https://shiiks.github.io/l10n/` with zero setup.
 |-------|------|--------|
 | 1. Software | Browser app: mic → live STT → translation → TTS out | ✅ this repo |
 | 2. Earbuds testing | Use phase 1 with regular Bluetooth earbuds, measure latency/UX | next |
-| 3. Native speech-to-speech | Swap the STT→text→TTS chain for a realtime audio model (Gemini Live / OpenAI Realtime) to cut latency and preserve voice tone | later |
+| 3. Native speech-to-speech | Swap the STT→text→TTS chain for a realtime audio model (Gemini Live) to cut latency and preserve voice tone | ✅ Realtime mode (Gemini API key) |
 | 4. Hardware | Only if software on commodity earbuds isn't enough | later |
 
 ## Phase 1: the web app (`web/`)
@@ -78,11 +78,36 @@ A zero-build, zero-backend static page. Four input sources feed one pipeline
 or screen) and tick **"Share tab audio"** — otherwise there's no audio to
 translate. Desktop Chrome/Edge only.
 
-### Automated test
+### Phase 3: ⚡ Realtime speech-to-speech mode
 
-`test/e2e.js` drives a headless Chromium through the file source with a speech
-recording and asserts a translation appears (needs `playwright`; see the file
-header). It's what CI-style verification of the media pipeline looks like.
+The **mode switch** under the source tabs picks the pipeline:
+
+- **Chunked (free)** — the pipeline above. No key, a few seconds behind,
+  generic TTS voice.
+- **Realtime (Gemini Live)** — one model (`gemini-3.5-live-translate-preview`)
+  hears the audio and *speaks* the translation, streaming both ways over a
+  WebSocket (`web/realtime.js`). Roughly a second behind, keeps the speaker's
+  pacing and intonation, and the source language is detected automatically.
+  Works with every audio source — mic, file, tab — and needs a Gemini API key
+  in ⚙ Settings. Typed text still goes through the chunked path (the translate
+  model accepts audio only).
+
+What the client handles for you: 16 kHz PCM up / 24 kHz PCM down with
+gapless scheduled playback, live input/output transcripts, subtitles,
+interruption, and the Live API's connection recycling — the server sends
+`goAway` roughly every 10 minutes; the client reconnects with the session's
+resume handle so nothing is lost, and context-window compression lifts the
+15-minute audio cap.
+
+### Automated tests
+
+- `test/e2e.js` — chunked mode: drives headless Chromium through the file
+  source with a speech recording and asserts a translation appears (needs
+  `playwright`; see the file header).
+- `test/mock-live.js` + `test/e2e-realtime.js` — realtime mode without an API
+  key: a mock Live API server that speaks the real protocol (setup, audio
+  chunks, transcripts, audio replies, `goAway` + resume), and a test that
+  streams a file and the fake microphone through it and asserts reconnection.
 
 ### Run it
 
