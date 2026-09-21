@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>l10n — live speech translator</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="app">
+    <header>
+      <h1>l10n <span class="tagline">live speech translator</span></h1>
+      <button id="settingsBtn" class="ghost" title="Settings">⚙</button>
+    </header>
+
+    <div id="unsupportedBanner" class="banner hidden">
+      This browser does not support the Web Speech API, so the Microphone source
+      is unavailable. Text, file and tab sources still work. For the microphone
+      use Chrome or Edge (desktop or Android).
+    </div>
+
+    <nav class="tabs" id="sourceTabs">
+      <button class="tab active" data-source="mic">🎙 Microphone</button>
+      <button class="tab" data-source="text">⌨ Text</button>
+      <button class="tab" data-source="file">🎬 Video / audio file</button>
+      <button class="tab" data-source="tab">🖥 Browser tab</button>
+    </nav>
+
+    <section class="mode-row" id="modeRow">
+      <button class="mode active" data-mode="chunked">Chunked pipeline (free)</button>
+      <button class="mode" data-mode="realtime">⚡ Realtime speech-to-speech (Gemini Live)</button>
+      <span class="hint" id="modeHint"></span>
+    </section>
+
+    <section class="engine-row chunked-only" id="engineRow">
+      <label class="lang-select engine-select">
+        <span>Speech-to-text engine</span>
+        <select id="engineSelect">
+          <option value="Xenova/whisper-tiny">Whisper tiny — in browser, fastest</option>
+          <option value="Xenova/whisper-base" selected>Whisper base — in browser, balanced</option>
+          <option value="Xenova/whisper-small">Whisper small — in browser, most accurate</option>
+          <option value="bhashini">Bhashini — Indian languages (ULCA credentials)</option>
+          <option value="gemini">Gemini audio — API key required</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="lang-row">
+      <label class="lang-select">
+        <span>Source language</span>
+        <select id="srcLang"></select>
+      </label>
+      <button id="swapBtn" class="ghost" title="Swap languages">⇄</button>
+      <label class="lang-select">
+        <span>Translate to</span>
+        <select id="tgtLang"></select>
+      </label>
+    </section>
+
+    <section id="panelText" class="panel hidden">
+      <textarea id="textInput" rows="3" placeholder="Type or paste text, then press Enter (Shift+Enter for a new line)"></textarea>
+      <button id="textTranslateBtn">Translate</button>
+    </section>
+
+    <section id="panelMedia" class="panel hidden">
+      <div class="media-controls">
+        <input type="file" id="fileInput" accept="audio/*,video/*" class="file-only" />
+        <button id="shareTabBtn" class="tab-only">🖥 Share a tab with audio</button>
+        <label class="check file-only"><input type="checkbox" id="muteOriginal" /> Mute original audio (dub)</label>
+      </div>
+      <div id="engineProgress" class="progress hidden"><div id="engineProgressBar"></div><span id="engineProgressText"></span></div>
+      <div class="video-wrap">
+        <video id="mediaVideo" controls playsinline></video>
+        <div id="subtitle" class="subtitle"></div>
+      </div>
+    </section>
+
+    <section class="panes">
+      <div class="pane">
+        <div class="pane-title">You said</div>
+        <div id="srcFinal" class="transcript"></div>
+        <div id="srcInterim" class="transcript interim"></div>
+      </div>
+      <div class="pane">
+        <div class="pane-title">Translation</div>
+        <div id="tgtFinal" class="transcript"></div>
+        <div id="tgtInterim" class="transcript interim"></div>
+      </div>
+    </section>
+
+    <section class="controls">
+      <button id="micBtn" class="mic mic-only">🎙 Start listening</button>
+      <label class="lang-select mic-only chunked-only mic-engine">
+        <span>Recognizer</span>
+        <select id="micEngineSelect">
+          <option value="browser">Browser streaming (Google)</option>
+          <option value="media">Speech-to-text engine above (Whisper / Bhashini)</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" id="speakToggle" checked /> Speak translation</label>
+      <label class="check mic-only"><input type="checkbox" id="duckToggle" checked /> Pause mic while speaking</label>
+      <button id="clearBtn" class="ghost">Clear</button>
+    </section>
+
+    <footer>
+      <span id="status">Idle</span>
+      <span id="latency"></span>
+    </footer>
+
+    <dialog id="settingsDialog">
+      <h2>Settings</h2>
+      <label class="field">
+        <span>Translation provider</span>
+        <select id="providerSelect">
+          <option value="free">Free (no API key, lower quality)</option>
+          <option value="bhashini">Bhashini — Indian languages (ULCA credentials)</option>
+          <option value="gemini">Gemini API (key required)</option>
+          <option value="claude">Claude API (key required)</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>API key (Gemini / Claude)</span>
+        <input type="password" id="apiKeyInput" placeholder="Only needed for Gemini / Claude / Realtime" autocomplete="off" />
+      </label>
+      <label class="field">
+        <span>Bhashini ULCA userID</span>
+        <input type="text" id="bhashiniUserInput" placeholder="From bhashini.gov.in → ULCA → My Profile" autocomplete="off" />
+      </label>
+      <label class="field">
+        <span>Bhashini ULCA API key</span>
+        <input type="password" id="bhashiniKeyInput" autocomplete="off" />
+      </label>
+      <label class="field">
+        <span>Speech output</span>
+        <select id="ttsSelect">
+          <option value="browser">Browser voices</option>
+          <option value="bhashini">Bhashini voices — Indian languages</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Browser voice for translated speech</span>
+        <select id="voiceSelect">
+          <option value="">Auto (match target language)</option>
+        </select>
+      </label>
+      <div class="dialog-actions">
+        <button id="settingsSave">Save</button>
+        <button id="voiceTest" class="ghost">🔊 Test voice</button>
+        <button id="settingsClose" class="ghost">Close</button>
+      </div>
+      <p class="hint" id="voiceCountHint"></p>
+      <p class="hint">
+        Keys are stored only in this browser (localStorage) and sent directly to the
+        provider — there is no backend.
+      </p>
+    </dialog>
+  </main>
+  <script src="media.js"></script>
+  <script src="bhashini.js"></script>
+  <script src="realtime.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
