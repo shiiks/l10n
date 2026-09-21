@@ -40,12 +40,30 @@ permanently testable at `https://shiiks.github.io/l10n/` with zero setup.
 
 ## Phase 1: the web app (`web/`)
 
-A zero-build, zero-backend static page:
+A zero-build, zero-backend static page. Four input sources feed one pipeline
+(speech → text → translation → spoken audio + on-screen text):
 
-- **Streaming speech recognition** via the Web Speech API (Chrome/Edge; also
-  Chrome on Android — recognition quality is Google's own engine).
-- **Live translation preview** while you're mid-sentence, plus a final
-  translation per utterance, with per-utterance latency shown in the footer.
+| Source | How it's transcribed | Typical use |
+|--------|----------------------|-------------|
+| 🎙 **Microphone** | Web Speech API (Chrome/Edge, Google's engine) — streaming, with live interim text | Face-to-face conversation, earbuds |
+| ⌨ **Text** | — (typed/pasted, Enter to translate) | Quick phrases, chat |
+| 🎬 **Video / audio file** | Whisper in-browser *or* Gemini audio | Watch a foreign-language video with live subtitles, or dub it |
+| 🖥 **Browser tab** | Whisper in-browser *or* Gemini audio | Live subtitles for YouTube, a meeting, a stream — anything playing in another tab |
+
+- **Streaming speech recognition** for the mic, with a live translation preview
+  while you're mid-sentence and per-utterance latency shown in the footer.
+- **File and tab audio** is cut into chunks at natural pauses (simple energy
+  VAD, 1–8 s) and transcribed by a speech-to-text engine that accepts raw
+  audio — the Web Speech API can't, it only listens to the microphone:
+  - *Whisper tiny / base / small* run **entirely in your browser** via
+    transformers.js (no API key, nothing leaves your machine). The model
+    downloads once (~40 / 75 / 250 MB) and is cached. Uses WebGPU when
+    available, otherwise WASM — pick a smaller model if the status bar says
+    it's falling behind.
+  - *Gemini audio* sends each chunk to the Gemini API (key required) for
+    better accuracy on hard audio and low-resource languages.
+- **Live subtitles** overlay the video; **"Mute original audio (dub)"** replaces
+  the original soundtrack with the spoken translation.
 - **Spoken output** via browser TTS, played through whatever audio output is
   active — i.e. your earbuds when they're connected.
 - **Pluggable translation providers**:
@@ -55,6 +73,16 @@ A zero-build, zero-backend static page:
     better conversational translations. Keys live only in your browser's
     localStorage and go straight to the provider.
 - 18 languages including Hindi, Bengali, Tamil, Telugu, Marathi, Gujarati, Urdu.
+
+**Tab capture tips:** in the share picker choose a *Chrome Tab* (not a window
+or screen) and tick **"Share tab audio"** — otherwise there's no audio to
+translate. Desktop Chrome/Edge only.
+
+### Automated test
+
+`test/e2e.js` drives a headless Chromium through the file source with a speech
+recording and asserts a translation appears (needs `playwright`; see the file
+header). It's what CI-style verification of the media pipeline looks like.
 
 ### Run it
 
@@ -106,12 +134,16 @@ options are GitHub Pages, `npx serve` behind a tunnel (e.g. `cloudflared`,
 ## Architecture
 
 ```
-mic ──► STT (streaming) ──► Translator (pluggable) ──► TTS ──► audio out
-        Web Speech API       free / Gemini / Claude     speechSynthesis
+mic ─────────► Web Speech API ──┐
+text ───────────────────────────┤
+video/audio file ─► chunker ─► Whisper (in-browser) or Gemini audio ─┤
+browser tab ──────► chunker ─►            (media.js)                 ─┤
+                                                                      ▼
+                              Translator (free / Gemini / Claude) ─► TTS + subtitles
 ```
 
-Each stage is isolated in `web/app.js` behind a small interface, so phase 3 can
-replace the middle of the chain (or the whole chain) with a realtime
+Each stage is isolated behind a small interface (`Translators`, `L10nMedia.Engines`,
+`speak()`), so phase 3 can replace the middle of the chain with a realtime
 speech-to-speech model over WebSocket without touching the UI, and phase 4 can
 reuse the same pipeline on embedded hardware.
 

@@ -1,5 +1,6 @@
 .git
 .github
+test
 README.md
 LICENSE
 docker-compose.yml

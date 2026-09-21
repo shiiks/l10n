@@ -1,10 +1,12 @@
 /**
- * l10n — live speech translator (software-first prototype)
+ * l10n — live translator (software-first prototype)
  *
- * Pipeline: mic → SpeechRecognition (streaming STT) → Translator (pluggable)
+ * Pipeline: source → speech-to-text → Translator (pluggable)
  *           → speechSynthesis (TTS) → active audio output (e.g. earbuds).
  *
- * The three stages are deliberately decoupled so any of them can later be
+ * Sources: microphone (Web Speech API streaming STT), typed text, a video or
+ * audio file, or any browser tab (both via media.js: Whisper in-browser or
+ * Gemini audio). The stages are deliberately decoupled so any of them can be
  * swapped for a native realtime speech-to-speech model or on-device hardware.
  */
 
@@ -140,6 +142,12 @@ const el = {
   providerSelect: $('providerSelect'), apiKeyInput: $('apiKeyInput'),
   voiceSelect: $('voiceSelect'), settingsSave: $('settingsSave'),
   settingsClose: $('settingsClose'), voiceTest: $('voiceTest'),
+  sourceTabs: $('sourceTabs'), panelText: $('panelText'), panelMedia: $('panelMedia'),
+  textInput: $('textInput'), textTranslateBtn: $('textTranslateBtn'),
+  fileInput: $('fileInput'), shareTabBtn: $('shareTabBtn'), engineSelect: $('engineSelect'),
+  muteOriginal: $('muteOriginal'), engineProgress: $('engineProgress'),
+  engineProgressBar: $('engineProgressBar'), engineProgressText: $('engineProgressText'),
+  mediaVideo: $('mediaVideo'), subtitle: $('subtitle'),
 };
 
 function setStatus(text) { el.status.textContent = text; }
@@ -277,6 +285,7 @@ async function handleFinalUtterance(text) {
     const translated = await translate(text);
     if (seq === state.utteranceSeq) el.tgtInterim.textContent = '';
     appendLine(el.tgtFinal, translated);
+    el.subtitle.textContent = translated;
     el.latency.textContent = `translate: ${Math.round(performance.now() - t0)} ms`;
     if (el.speakToggle.checked) speak(translated);
   } catch (err) {
@@ -312,7 +321,185 @@ el.clearBtn.addEventListener('click', () => {
   el.tgtFinal.innerHTML = '';
   el.srcInterim.textContent = '';
   el.tgtInterim.textContent = '';
+  el.subtitle.textContent = '';
   el.latency.textContent = '';
+});
+
+// ---------------------------------------------------------------------------
+// Input sources: mic (above) | text | video/audio file | browser tab
+// ---------------------------------------------------------------------------
+state.source = 'mic';
+state.media = null;        // active L10nMedia session
+state.mediaQueue = [];     // pending audio chunks awaiting transcription
+state.transcribing = false;
+
+function setSource(source) {
+  if (source === state.source) return;
+  if (state.listening) { state.listening = false; stopEngine(); updateMicButton(); }
+  closeMediaSession();
+  if (el.mediaVideo.srcObject) {
+    el.mediaVideo.srcObject.getTracks().forEach((t) => t.stop());
+    el.mediaVideo.srcObject = null;
+  }
+  state.source = source;
+  document.body.dataset.source = source;
+  for (const tab of el.sourceTabs.querySelectorAll('.tab')) {
+    tab.classList.toggle('active', tab.dataset.source === source);
+  }
+  el.panelText.classList.toggle('hidden', source !== 'text');
+  el.panelMedia.classList.toggle('hidden', source !== 'file' && source !== 'tab');
+  setStatus('Idle');
+  if (source === 'text') el.textInput.focus();
+}
+document.body.dataset.source = 'mic';
+
+el.sourceTabs.addEventListener('click', (event) => {
+  const tab = event.target.closest('.tab');
+  if (tab) { unlockTTS(); setSource(tab.dataset.source); }
+});
+
+// --- Text -------------------------------------------------------------------
+function submitText() {
+  const text = el.textInput.value.trim();
+  if (!text) return;
+  el.textInput.value = '';
+  handleFinalUtterance(text);
+}
+el.textTranslateBtn.addEventListener('click', () => { unlockTTS(); submitText(); });
+el.textInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); unlockTTS(); submitText(); }
+});
+
+// --- Shared media pipeline: chunk → transcribe → handleFinalUtterance --------
+function showEngineProgress(file, pct) {
+  el.engineProgress.classList.remove('hidden');
+  if (file === 'ready') {
+    el.engineProgressText.textContent = 'Speech model ready';
+    el.engineProgressBar.style.width = '100%';
+    setTimeout(() => el.engineProgress.classList.add('hidden'), 1500);
+    return;
+  }
+  el.engineProgressBar.style.width = `${Math.round(pct)}%`;
+  el.engineProgressText.textContent = `Downloading speech model… ${file.split('/').pop()} ${Math.round(pct)}%`;
+}
+
+async function loadEngine() {
+  const choice = el.engineSelect.value;
+  if (choice === 'gemini') {
+    return L10nMedia.Engines.gemini({
+      apiKey: settings.apiKey,
+      langName: langByCode(el.srcLang.value)?.name,
+    });
+  }
+  return L10nMedia.Engines.whisper({ model: choice, onProgress: showEngineProgress });
+}
+
+function onAudioChunk(chunk) {
+  // Keep the queue short: if transcription can't keep up, skip the oldest
+  // chunks rather than drifting ever further behind the live audio.
+  if (state.mediaQueue.length >= 3) {
+    state.mediaQueue.shift();
+    setStatus('Falling behind — try the smaller Whisper model');
+  }
+  state.mediaQueue.push(chunk);
+  drainMediaQueue();
+}
+
+async function drainMediaQueue() {
+  if (state.transcribing) return;
+  state.transcribing = true;
+  try {
+    while (state.mediaQueue.length) {
+      const chunk = state.mediaQueue.shift();
+      setStatus('Transcribing…');
+      const t0 = performance.now();
+      const transcribe = await loadEngine();
+      const text = await transcribe(chunk, el.srcLang.value);
+      state.lastMediaError = null;
+      el.latency.textContent = `stt: ${Math.round(performance.now() - t0)} ms`;
+      if (text) handleFinalUtterance(text);
+    }
+    if (state.media) setStatus('Listening to media…');
+  } catch (err) {
+    if (err.message !== state.lastMediaError) appendLine(el.tgtFinal, `⚠ ${err.message}`, true);
+    state.lastMediaError = err.message;
+    setStatus('Transcription error');
+  } finally {
+    state.transcribing = false;
+  }
+}
+
+function closeMediaSession() {
+  if (state.media) { state.media.close(); state.media = null; }
+  state.mediaQueue = [];
+  el.subtitle.textContent = '';
+}
+
+// --- Video / audio file -------------------------------------------------------
+el.fileInput.addEventListener('change', async () => {
+  const file = el.fileInput.files[0];
+  if (!file) return;
+  unlockTTS();
+  closeMediaSession();
+  el.mediaVideo.srcObject = null;
+  el.mediaVideo.src = URL.createObjectURL(file);
+  el.mediaVideo.muted = false;
+  try {
+    state.media = await L10nMedia.openElementSession(el.mediaVideo, { onChunk: onAudioChunk });
+    state.media.setOriginalVolume(el.muteOriginal.checked ? 0 : 1);
+    setStatus('Press play to start translating');
+    loadEngine().catch(() => {}); // warm the model while the user hits play
+  } catch (err) {
+    appendLine(el.tgtFinal, `⚠ Could not capture audio: ${err.message}`, true);
+  }
+});
+
+el.muteOriginal.addEventListener('change', () => {
+  if (state.media) state.media.setOriginalVolume(el.muteOriginal.checked ? 0 : 1);
+});
+
+el.mediaVideo.addEventListener('play', () => {
+  if (state.media) { state.media.resume(); setStatus('Listening to media…'); }
+});
+el.mediaVideo.addEventListener('pause', () => { if (state.media) state.media.chunker.flush(); });
+el.mediaVideo.addEventListener('ended', () => { if (state.media) state.media.chunker.flush(); });
+
+// --- Browser tab ---------------------------------------------------------------
+el.shareTabBtn.addEventListener('click', async () => {
+  unlockTTS();
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    appendLine(el.tgtFinal, '⚠ Tab capture is not supported in this browser (use desktop Chrome/Edge).', true);
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  } catch (_) {
+    return; // user cancelled the picker
+  }
+  if (stream.getAudioTracks().length === 0) {
+    stream.getTracks().forEach((t) => t.stop());
+    appendLine(el.tgtFinal, '⚠ No audio in the shared tab — tick "Share tab audio" in the picker and choose a tab, not a window.', true);
+    return;
+  }
+  closeMediaSession();
+  el.mediaVideo.src = '';
+  el.mediaVideo.srcObject = stream;
+  el.mediaVideo.muted = true; // the tab itself is already audible
+  el.mediaVideo.play().catch(() => {});
+  try {
+    state.media = await L10nMedia.openStreamSession(stream, { onChunk: onAudioChunk });
+    await state.media.resume();
+    setStatus('Listening to tab…');
+    loadEngine().catch(() => {});
+  } catch (err) {
+    appendLine(el.tgtFinal, `⚠ Could not capture tab audio: ${err.message}`, true);
+  }
+  stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+    closeMediaSession();
+    el.mediaVideo.srcObject = null;
+    setStatus('Tab sharing stopped');
+  });
 });
 
 // ---------------------------------------------------------------------------
