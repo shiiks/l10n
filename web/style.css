@@ -98,6 +98,15 @@ body:not([data-source="tab"]) .tab-only { display: none !important; }
 
 body[data-mode="realtime"] .chunked-only { display: none !important; }
 
+/* The speech-to-text engine applies to file/tab, and to the mic only when the
+   mic is set to use it instead of the browser's streaming recognizer. */
+.engine-row { display: none; }
+body[data-source="file"] .engine-row,
+body[data-source="tab"] .engine-row,
+body[data-source="mic"][data-mic-engine="media"] .engine-row { display: flex; }
+
+.mic-engine { flex: 0 1 18rem; }
+
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);

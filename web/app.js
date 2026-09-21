@@ -34,6 +34,11 @@ const LANGUAGES = [
   { code: 'mr', bcp47: 'mr-IN', name: 'Marathi' },
   { code: 'gu', bcp47: 'gu-IN', name: 'Gujarati' },
   { code: 'ur', bcp47: 'ur-PK', name: 'Urdu' },
+  { code: 'kn', bcp47: 'kn-IN', name: 'Kannada' },
+  { code: 'ml', bcp47: 'ml-IN', name: 'Malayalam' },
+  { code: 'pa', bcp47: 'pa-IN', name: 'Punjabi' },
+  { code: 'or', bcp47: 'or-IN', name: 'Odia' },
+  { code: 'as', bcp47: 'as-IN', name: 'Assamese' },
 ];
 
 const langByCode = (code) => LANGUAGES.find((l) => l.code === code);
@@ -60,6 +65,11 @@ const Translators = {
       const data = await res.json();
       return data.responseData.translatedText;
     }
+  },
+
+  /** Bhashini / IndicTrans2 — India's national platform, Indian languages + English. */
+  bhashini(text, src, tgt) {
+    return Bhashini.translate(text, src, tgt);
   },
 
   async gemini(text, src, tgt) {
@@ -117,7 +127,16 @@ const settings = {
   provider: localStorage.getItem('l10n.provider') || 'free',
   apiKey: localStorage.getItem('l10n.apiKey') || '',
   voiceURI: localStorage.getItem('l10n.voiceURI') || '',
+  tts: localStorage.getItem('l10n.tts') || 'browser',             // 'browser' | 'bhashini'
+  micEngine: localStorage.getItem('l10n.micEngine') || 'browser', // 'browser' | 'media'
+  bhashiniUserId: localStorage.getItem('l10n.bhashiniUserId') || '',
+  bhashiniKey: localStorage.getItem('l10n.bhashiniKey') || '',
 };
+Bhashini.configure({
+  userID: settings.bhashiniUserId,
+  ulcaApiKey: settings.bhashiniKey,
+  configUrl: new URLSearchParams(location.search).get('bhashiniConfigUrl') || undefined, // test hook
+});
 
 const state = {
   listening: false,      // user intent: mic should be on
@@ -150,6 +169,8 @@ const el = {
   engineProgressBar: $('engineProgressBar'), engineProgressText: $('engineProgressText'),
   mediaVideo: $('mediaVideo'), subtitle: $('subtitle'),
   modeRow: $('modeRow'), modeHint: $('modeHint'),
+  micEngineSelect: $('micEngineSelect'), ttsSelect: $('ttsSelect'),
+  bhashiniUserInput: $('bhashiniUserInput'), bhashiniKeyInput: $('bhashiniKeyInput'),
 };
 
 function setStatus(text) { el.status.textContent = text; }
@@ -262,20 +283,65 @@ function updateMicButton() {
 
 el.micBtn.addEventListener('click', async () => {
   unlockTTS(); // user gesture — unlock speech output for later programmatic use
-  if (!isRealtime() && !SpeechRecognition) {
-    appendLine(el.tgtFinal, '⚠ This browser has no speech recognition. Use Chrome/Edge, or switch to Realtime mode.', true);
+  const useBrowserStt = !isRealtime() && settings.micEngine === 'browser';
+  if (useBrowserStt && !SpeechRecognition) {
+    appendLine(el.tgtFinal, '⚠ This browser has no speech recognition. Set the recognizer to the speech-to-text engine, or switch to Realtime mode.', true);
     return;
   }
   state.listening = !state.listening;
   updateMicButton();
-  if (isRealtime()) {
-    if (state.listening) await startRealtimeMic();
-    else stopRealtimeMic();
-    return;
-  }
-  if (state.listening) startEngine();
-  else { stopEngine(); setStatus('Idle'); }
+  if (!state.listening) { stopMic(); return; }
+  if (isRealtime()) await startRealtimeMic();
+  else if (settings.micEngine === 'media') await startMediaMic();
+  else startEngine();
 });
+
+/** Stop whichever microphone path is active. */
+function stopMic() {
+  if (isRealtime()) stopRealtimeMic();
+  else if (state.micSession) stopMediaMic();
+  else { stopEngine(); setStatus('Idle'); }
+}
+
+el.micEngineSelect.value = settings.micEngine;
+document.body.dataset.micEngine = settings.micEngine;
+el.micEngineSelect.addEventListener('change', () => {
+  if (state.listening) { state.listening = false; updateMicButton(); stopMic(); }
+  settings.micEngine = el.micEngineSelect.value;
+  localStorage.setItem('l10n.micEngine', settings.micEngine);
+  document.body.dataset.micEngine = settings.micEngine;
+});
+
+// Mic through the media engines (Whisper / Bhashini / Gemini) instead of the
+// browser's recognizer — same chunker + transcription queue as file/tab audio.
+state.micSession = null;
+state.micStream = null;
+
+async function startMediaMic() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    const session = await L10nMedia.openStreamSession(stream, { onChunk: onAudioChunk });
+    await session.resume();
+    state.micSession = session;
+    state.micStream = stream;
+    setStatus('Listening (chunked)…');
+    loadEngine().catch(() => {});
+  } catch (err) {
+    appendLine(el.tgtFinal, `⚠ ${err.message}`, true);
+    state.listening = false;
+    updateMicButton();
+    setStatus('Idle');
+  }
+}
+
+function stopMediaMic() {
+  if (state.micSession) { state.micSession.close(); state.micSession = null; }
+  if (state.micStream) { state.micStream.getTracks().forEach((t) => t.stop()); state.micStream = null; }
+  state.mediaQueue = [];
+  setStatus('Idle');
+}
 
 // ---------------------------------------------------------------------------
 // Translation
@@ -346,7 +412,7 @@ function teardownSources() {
   if (state.listening) {
     state.listening = false;
     updateMicButton();
-    if (isRealtime()) stopRealtimeMic(); else stopEngine();
+    stopMic();
   }
   closeMediaSession();
   if (el.mediaVideo.srcObject) {
@@ -403,6 +469,7 @@ function showEngineProgress(file, pct) {
 
 async function loadEngine() {
   const choice = el.engineSelect.value;
+  if (choice === 'bhashini') return L10nMedia.Engines.bhashini();
   if (choice === 'gemini') {
     return L10nMedia.Engines.gemini({
       apiKey: settings.apiKey,
@@ -437,7 +504,8 @@ async function drainMediaQueue() {
       el.latency.textContent = `stt: ${Math.round(performance.now() - t0)} ms`;
       if (text) handleFinalUtterance(text);
     }
-    if (state.media) setStatus('Listening to media…');
+    if (state.micSession) setStatus('Listening (chunked)…');
+    else if (state.media) setStatus('Listening to media…');
   } catch (err) {
     if (err.message !== state.lastMediaError) appendLine(el.tgtFinal, `⚠ ${err.message}`, true);
     state.lastMediaError = err.message;
@@ -689,19 +757,65 @@ function startKeepalive() {
   }, 10000);
 }
 
-function finishSpeaking() {
-  if (speechSynthesis.speaking || speechSynthesis.pending) return; // queue continues
+/** Mic ducking: stop capturing while the app itself is speaking. */
+function beginSpeaking() {
+  state.speaking = true;
+  if (el.duckToggle.checked) {
+    if (state.recognizing) stopEngine();
+    state.micSession?.setMuted(true);
+  }
+}
+
+function afterSpeaking() {
   state.speaking = false;
   clearInterval(keepaliveTimer);
-  if (state.listening && !state.recognizing) {
+  state.micSession?.setMuted(false);
+  if (state.listening && settings.micEngine === 'browser' && !isRealtime() && !state.recognizing) {
     setTimeout(() => { if (state.listening && !state.recognizing) startEngine(); }, 200);
   } else if (!state.listening) {
     setStatus('Idle');
   }
 }
 
+function finishSpeaking() {
+  if (speechSynthesis.speaking || speechSynthesis.pending) return; // queue continues
+  afterSpeaking();
+}
+
 function speak(text) {
   const tgt = el.tgtLang.value;
+  if (settings.tts === 'bhashini' && Bhashini.supports(tgt)) {
+    ttsQueue = ttsQueue.then(() => speakViaBhashini(text, tgt));
+    return;
+  }
+  speakViaBrowser(text, tgt);
+}
+
+let ttsQueue = Promise.resolve();
+
+async function speakViaBhashini(text, lang) {
+  beginSpeaking();
+  try {
+    const base64 = await Bhashini.synthesize(text, lang);
+    const ctx = L10nMedia.getAudioContext();
+    await ctx.resume();
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const buffer = await ctx.decodeAudioData(bytes.buffer);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    setStatus('Speaking…');
+    await new Promise((resolve) => { source.onended = resolve; source.start(); });
+  } catch (err) {
+    appendLine(el.tgtFinal, `⚠ Speech output failed: ${err.message}`, true);
+  } finally {
+    afterSpeaking();
+  }
+}
+
+function speakViaBrowser(text, tgt) {
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.lang = langByCode(tgt)?.bcp47 || tgt;
   const voice = pickVoice(tgt);
@@ -710,15 +824,14 @@ function speak(text) {
   } else if (!missingVoiceWarned) {
     missingVoiceWarned = true;
     const name = langByCode(tgt)?.name || tgt;
-    appendLine(el.tgtFinal, `⚠ No ${name} voice installed in this browser — trying the system default. Pick a voice in ⚙ Settings.`, true);
+    appendLine(el.tgtFinal, `⚠ No ${name} voice installed in this browser — trying the system default. Pick a voice in ⚙ Settings, or use Bhashini voices for Indian languages.`, true);
   }
 
   // Release the mic BEFORE speaking: while recognition holds the audio
   // session (notably Chrome on Android), TTS is silently discarded and
   // onstart never fires. state.speaking is set synchronously so the
   // recognizer's onend handler doesn't immediately restart the mic.
-  state.speaking = true;
-  if (el.duckToggle.checked && state.recognizing) stopEngine();
+  beginSpeaking();
 
   utterance.onstart = () => setStatus('Speaking…');
   utterance.onend = finishSpeaking;
@@ -753,6 +866,9 @@ function unlockTTS() {
 el.settingsBtn.addEventListener('click', () => {
   el.providerSelect.value = settings.provider;
   el.apiKeyInput.value = settings.apiKey;
+  el.bhashiniUserInput.value = settings.bhashiniUserId;
+  el.bhashiniKeyInput.value = settings.bhashiniKey;
+  el.ttsSelect.value = settings.tts;
   refreshVoices();
   el.settingsDialog.showModal();
 });
@@ -761,9 +877,16 @@ el.settingsSave.addEventListener('click', () => {
   settings.provider = el.providerSelect.value;
   settings.apiKey = el.apiKeyInput.value.trim();
   settings.voiceURI = el.voiceSelect.value;
+  settings.tts = el.ttsSelect.value;
+  settings.bhashiniUserId = el.bhashiniUserInput.value.trim();
+  settings.bhashiniKey = el.bhashiniKeyInput.value.trim();
   localStorage.setItem('l10n.provider', settings.provider);
   localStorage.setItem('l10n.apiKey', settings.apiKey);
   localStorage.setItem('l10n.voiceURI', settings.voiceURI);
+  localStorage.setItem('l10n.tts', settings.tts);
+  localStorage.setItem('l10n.bhashiniUserId', settings.bhashiniUserId);
+  localStorage.setItem('l10n.bhashiniKey', settings.bhashiniKey);
+  Bhashini.configure({ userID: settings.bhashiniUserId, ulcaApiKey: settings.bhashiniKey });
   el.settingsDialog.close();
 });
 
@@ -772,11 +895,14 @@ el.settingsClose.addEventListener('click', () => el.settingsDialog.close());
 el.voiceTest.addEventListener('click', () => {
   // Use the dialog's current (unsaved) selection so voices can be auditioned.
   const prev = settings.voiceURI;
+  const prevTts = settings.tts;
   settings.voiceURI = el.voiceSelect.value;
+  settings.tts = el.ttsSelect.value;
   missingVoiceWarned = false;
   ttsUnlocked = true; // this click is itself the unlocking gesture
   speak('Testing, one two three.');
   settings.voiceURI = prev;
+  settings.tts = prevTts;
 });
 
 updateMicButton();

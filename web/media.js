@@ -92,7 +92,9 @@ const L10nMedia = (() => {
 
     const chunker = opts.onChunk ? new SpeechChunker(opts) : null;
     const capture = new AudioWorkletNode(ctx, 'pcm-capture');
+    let muted = false;
     capture.port.onmessage = (event) => {
+      if (muted) return;
       if (opts.onSamples) opts.onSamples(event.data);
       if (chunker) chunker.push(event.data);
     };
@@ -109,6 +111,8 @@ const L10nMedia = (() => {
       chunker,
       resume: () => ctx.resume(),
       setOriginalVolume(v) { if (gain) gain.gain.value = v; },
+      /** Drop captured audio (e.g. while the app itself is speaking). */
+      setMuted(v) { muted = v; if (v && chunker) chunker.reset(); },
       close() {
         if (chunker) chunker.flush();
         try { sourceNode.disconnect(capture); } catch (_) {}
@@ -195,6 +199,11 @@ const L10nMedia = (() => {
       return load;
     },
 
+    /** Bhashini ASR (IndicConformer) for Indian languages. Needs ULCA credentials. */
+    async bhashini() {
+      return (audio, lang) => Bhashini.transcribe(audio, lang);
+    },
+
     /** Gemini multimodal transcription of a WAV chunk. Needs an API key. */
     async gemini({ apiKey, langName = 'the source language' } = {}) {
       if (!apiKey) throw new Error('Gemini API key missing — set it in Settings');
@@ -240,7 +249,7 @@ const L10nMedia = (() => {
     return btoa(binary);
   }
 
-  return { SAMPLE_RATE, openElementSession, openStreamSession, Engines, getAudioContext };
+  return { SAMPLE_RATE, openElementSession, openStreamSession, Engines, getAudioContext, encodeWavBase64 };
 })();
 
 window.L10nMedia = L10nMedia;

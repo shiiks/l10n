@@ -69,10 +69,34 @@ A zero-build, zero-backend static page. Four input sources feed one pipeline
 - **Pluggable translation providers**:
   - *Free* (default): unofficial Google Translate endpoint with MyMemory as
     fallback. No key, fine for prototyping.
+  - *Bhashini*: India's national language platform (see below).
   - *Gemini* or *Claude*: bring your own API key (⚙ Settings) for noticeably
     better conversational translations. Keys live only in your browser's
     localStorage and go straight to the provider.
-- 18 languages including Hindi, Bengali, Tamil, Telugu, Marathi, Gujarati, Urdu.
+- 23 languages including Hindi, Bengali, Tamil, Telugu, Marathi, Gujarati,
+  Urdu, Kannada, Malayalam, Punjabi, Odia and Assamese.
+
+### 🇮🇳 Bhashini for Indian languages
+
+[Bhashini](https://bhashini.gov.in/) is MeitY's open platform — the same
+stack that live-translated the 2026 Independence Day address into 22
+languages: **IndicConformer** speech recognition, **IndicTrans2** translation
+and Indic TTS, all built by AI4Bharat (IIT Madras) and served free through the
+ULCA/Dhruva APIs. It's generally far better than Whisper or generic MT on
+Indian languages, and it plugs into all three stages here:
+
+| Stage | Where to pick it |
+|-------|------------------|
+| Speech-to-text | *Speech-to-text engine* → **Bhashini**. For the mic, also set *Recognizer* → "Speech-to-text engine above" (the browser's own recognizer can't be swapped). |
+| Translation | ⚙ Settings → *Translation provider* → **Bhashini** |
+| Speech output | ⚙ Settings → *Speech output* → **Bhashini voices** (natural Indic voices instead of whatever your OS has installed) |
+
+Credentials: register at bhashini.gov.in → ULCA → **My Profile** gives you a
+`userID` and `ulcaApiKey`; paste both into ⚙ Settings. The browser calls the
+Bhashini endpoints directly (they allow it), so there's still no backend.
+Supported here: en, hi, bn, ta, te, mr, gu, ur, kn, ml, pa, or, as. Bhashini
+is chunk-based (it transcribes each pause-delimited chunk), so it belongs to
+the chunked pipeline; Realtime mode stays Gemini Live.
 
 **Tab capture tips:** in the share picker choose a *Chrome Tab* (not a window
 or screen) and tick **"Share tab audio"** — otherwise there's no audio to
@@ -108,6 +132,10 @@ resume handle so nothing is lost, and context-window compression lifts the
   key: a mock Live API server that speaks the real protocol (setup, audio
   chunks, transcripts, audio replies, `goAway` + resume), and a test that
   streams a file and the fake microphone through it and asserts reconnection.
+- `test/mock-bhashini.js` + `test/e2e-bhashini.js` — Bhashini without
+  credentials: a mock of the ULCA config + Dhruva inference endpoints that
+  validates request shapes, and a test that runs speech-to-text, translation
+  and speech output through it for both the file source and the microphone.
 
 ### Run it
 
