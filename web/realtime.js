@@ -70,10 +70,10 @@ class RealtimeTranslator {
     this.endpoint = opts.endpoint || null;
 
     this.ws = null;           // active socket
-    this.pending = null;      // replacement socket being opened (rollover)
     this.ready = false;
     this.active = false;      // user intent: keep the session alive
     this.rollingOver = false;
+    this.rolloverAgain = false;
     this.resumeHandle = null;
     this.reconnectAttempts = 0;
     this.setupMode = 'full';  // 'full' | 'noHandle' | 'minimal' — degrades if setup is rejected
@@ -188,7 +188,9 @@ class RealtimeTranslator {
           resolve(ws);
           return;
         }
-        if (ws === this.ws || ws._setupDone) this._handle(msg);
+        if (ws === this.ws) this._handle(msg);
+        else if (msg.sessionResumptionUpdate) this._handle({ sessionResumptionUpdate: msg.sessionResumptionUpdate });
+        // Anything else from a socket that isn't (or no longer is) the active one is ignored.
       };
       ws.onerror = () => { /* onclose carries the detail */ };
       ws.onclose = (event) => {
@@ -248,7 +250,8 @@ class RealtimeTranslator {
 
   /** Open the replacement socket now (with the resume handle) and swap when it's ready. */
   async _rollover(reason) {
-    if (this.rollingOver || !this.active) return;
+    if (!this.active) return;
+    if (this.rollingOver) { this.rolloverAgain = true; return; } // config changed mid-swap: run once more after
     this.rollingOver = true;
     const old = this.ws;
     try {
@@ -256,16 +259,22 @@ class RealtimeTranslator {
       if (!this.active) { next.close(1000, 'client closed'); return; }
       this.ws = next;
       this.stats.rollovers++;
-      if (old) {
+      if (old && old !== next) {
         old.onclose = old.onerror = old.onmessage = null;
         try { old.close(1000, reason); } catch (_) {}
       }
       this._afterSocketReady();
     } catch (err) {
-      // Couldn't pre-open; the old socket's close will drive a normal reconnect.
-      this._status(`Reconnect ahead of time failed (${err.message}) — will retry on close`);
+      if (!this.ws) {
+        // The old socket died while the replacement was connecting: fall
+        // back to the ordinary reconnect path instead of staying silent.
+        this._scheduleReconnect({ code: 0, reason: err.message });
+      } else {
+        this._status(`Reconnect ahead of time failed (${err.message}) — will retry on close`);
+      }
     } finally {
       this.rollingOver = false;
+      if (this.rolloverAgain) { this.rolloverAgain = false; this._rollover('settings changed'); }
     }
   }
 
@@ -275,7 +284,16 @@ class RealtimeTranslator {
     this._flushPlayback();
     this._finalize('close');
     if (!this.active) { this._status('Disconnected'); return; }
+    if (this.rollingOver) {
+      // The replacement is already on its way; let it take over.
+      this.ws = null;
+      this._status('Switching connection…');
+      return;
+    }
+    this._scheduleReconnect(event);
+  }
 
+  _scheduleReconnect(event) {
     const quota = event.code === 1011 && /quota/i.test(event.reason || '');
     if (quota) {
       this.active = false;
@@ -294,7 +312,7 @@ class RealtimeTranslator {
     this.stats.reconnects++;
     this._status(delay ? `Connection dropped — reconnecting in ${(delay / 1000).toFixed(1)} s` : 'Reconnecting…');
     setTimeout(async () => {
-      if (!this.active) return;
+      if (!this.active || this.ws) return; // a rollover may have completed meanwhile
       try {
         this.ws = await this._openWithFallback();
         this._afterSocketReady();
@@ -322,14 +340,13 @@ class RealtimeTranslator {
     clearInterval(this.watchdog); this.watchdog = null;
     clearTimeout(this.finalizeTimer); this.finalizeTimer = null;
     this._flushPlayback();
-    for (const ws of [this.ws, this.pending]) {
-      if (!ws) continue;
+    if (this.ws) {
       // Detach first: the close event fires asynchronously and must not
       // report status for a session the app has already moved past.
-      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
-      try { ws.close(1000, 'client closed'); } catch (_) {}
+      this.ws.onopen = this.ws.onmessage = this.ws.onerror = this.ws.onclose = null;
+      try { this.ws.close(1000, 'client closed'); } catch (_) {}
     }
-    this.ws = this.pending = null;
+    this.ws = null;
     this.ready = false;
     this._status('Disconnected');
   }
