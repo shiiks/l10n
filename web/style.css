@@ -263,6 +263,22 @@ button:hover { filter: brightness(1.1); }
   margin-bottom: 0.6rem;
 }
 
+.badge {
+  text-transform: none;
+  letter-spacing: 0;
+  margin-left: 0.5rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--accent);
+  font-size: 0.75rem;
+}
+
+.badge:empty { display: none; }
+
+.original-audio { flex: 0 1 16rem; }
+dialog .check { margin-bottom: 0.9rem; }
+
 .transcript {
   overflow-y: auto;
   line-height: 1.5;

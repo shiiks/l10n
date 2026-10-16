@@ -14,6 +14,13 @@ class PCMCapture extends AudioWorkletProcessor {
     this.count = 0;
     this.out = new Float32Array(BATCH);
     this.outLen = 0;
+    // 'flush' pushes whatever partial batch is pending (end of a file, pause).
+    this.port.onmessage = (event) => {
+      if (event.data === 'flush' && this.outLen > 0) {
+        this.port.postMessage(this.out.slice(0, this.outLen));
+        this.outLen = 0;
+      }
+    };
   }
 
   process(inputs) {

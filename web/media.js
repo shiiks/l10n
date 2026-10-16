@@ -113,6 +113,8 @@ const L10nMedia = (() => {
       setOriginalVolume(v) { if (gain) gain.gain.value = v; },
       /** Drop captured audio (e.g. while the app itself is speaking). */
       setMuted(v) { muted = v; if (v && chunker) chunker.reset(); },
+      /** Push the worklet's pending partial batch through now. */
+      flush() { capture.port.postMessage('flush'); },
       close() {
         if (chunker) chunker.flush();
         try { sourceNode.disconnect(capture); } catch (_) {}

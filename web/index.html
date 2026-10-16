@@ -66,7 +66,14 @@
       <div class="media-controls">
         <input type="file" id="fileInput" accept="audio/*,video/*" class="file-only" />
         <button id="shareTabBtn" class="tab-only">🖥 Share a tab with audio</button>
-        <label class="check file-only"><input type="checkbox" id="muteOriginal" /> Mute original audio (dub)</label>
+        <label class="lang-select file-only original-audio">
+          <span>Original audio</span>
+          <select id="originalAudio">
+            <option value="1">Full volume</option>
+            <option value="0.1">Quiet under the translation (dub)</option>
+            <option value="0">Muted</option>
+          </select>
+        </label>
       </div>
       <div id="engineProgress" class="progress hidden"><div id="engineProgressBar"></div><span id="engineProgressText"></span></div>
       <div class="video-wrap">
@@ -77,7 +84,7 @@
 
     <section class="panes">
       <div class="pane">
-        <div class="pane-title">You said</div>
+        <div class="pane-title">You said <span id="detectedLang" class="badge"></span></div>
         <div id="srcFinal" class="transcript"></div>
         <div id="srcInterim" class="transcript interim"></div>
       </div>
@@ -121,6 +128,13 @@
       <label class="field">
         <span>API key (Gemini / Claude)</span>
         <input type="password" id="apiKeyInput" placeholder="Only needed for Gemini / Claude / Realtime" autocomplete="off" />
+      </label>
+      <label class="check">
+        <input type="checkbox" id="echoToggle" /> Realtime: also re-speak input that is already in the target language
+      </label>
+      <label class="field">
+        <span>Realtime token endpoint (optional, for deployed sites)</span>
+        <input type="url" id="tokenEndpointInput" placeholder="https://your-server/api/token — mints ephemeral tokens so no API key lives in the browser" autocomplete="off" />
       </label>
       <label class="field">
         <span>Bhashini ULCA userID</span>

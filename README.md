@@ -111,17 +111,73 @@ The **mode switch** under the source tabs picks the pipeline:
 - **Realtime (Gemini Live)** — one model (`gemini-3.5-live-translate-preview`)
   hears the audio and *speaks* the translation, streaming both ways over a
   WebSocket (`web/realtime.js`). Roughly a second behind, keeps the speaker's
-  pacing and intonation, and the source language is detected automatically.
-  Works with every audio source — mic, file, tab — and needs a Gemini API key
-  in ⚙ Settings. Typed text still goes through the chunked path (the translate
-  model accepts audio only).
+  pacing and intonation, and the source language is detected automatically
+  (the detected language shows as a badge on the "You said" pane). Works with
+  every audio source — mic, file, tab — and needs a Gemini API key in
+  ⚙ Settings (or a token endpoint, below). Typed text still goes through the
+  chunked path (the translate model accepts audio only).
 
-What the client handles for you: 16 kHz PCM up / 24 kHz PCM down with
-gapless scheduled playback, live input/output transcripts, subtitles,
-interruption, and the Live API's connection recycling — the server sends
-`goAway` roughly every 10 minutes; the client reconnects with the session's
-resume handle so nothing is lost, and context-window compression lifts the
-15-minute audio cap.
+What the client handles for you, following Google's Live API reference and
+their own translate bridge:
+
+- 16 kHz PCM up in 100 ms chunks, 24 kHz PCM down with gapless scheduled
+  playback; live interim/final transcripts, subtitles, and interruption.
+- **Connection recycling without a gap.** The server ends every connection
+  after ~10 minutes (`goAway`). The client opens the replacement socket
+  *while the old one is still running*, resumes the session with its handle,
+  and swaps — the same make-before-break pattern as Google's LiveKit bridge.
+  Context-window compression lifts the 15-minute audio cap, and the resume
+  handle is kept in `sessionStorage` so a reload within two hours continues
+  the same session.
+- **Changing the target language mid-session** keeps the session (config may
+  change on resume) instead of starting over.
+- `audioStreamEnd` is sent whenever input pauses — a paused video, a muted
+  mic, a stalled tab — so the model flushes what it has instead of waiting.
+- Transcripts finalize on `generationComplete`, `turnComplete`, interruption,
+  *or* a two-second gap, because the continuous translate model doesn't
+  always mark turns.
+- Readable failures: a bad API key is caught by a REST preflight before the
+  socket opens; quota exhaustion (close code 1011) stops retrying with a
+  clear message instead of a reconnect storm; expiries (1008) reconnect
+  immediately.
+- A **usage meter** in the footer: audio minutes in/out and the estimated
+  paid-tier cost (25 tokens per second of audio each way; the free tier
+  is $0).
+- Language codes are mapped to what the model expects (`zh-Hans`, `pt-BR`,
+  …). Odia and Assamese aren't supported by Live Translate yet — the app
+  says so and points you to the chunked pipeline, where Bhashini covers them.
+- ⚙ Settings has a toggle to re-speak input that is already in the target
+  language (`echoTargetLanguage`; off by default, which is Google's
+  recommendation for one-way interpreting).
+- The phone stays awake during a live session (Screen Wake Lock), and for
+  files you can keep the original soundtrack quiet under the translation
+  instead of muting it — the dubbing feel of Google's own sample.
+
+**Publishing it for other people: ephemeral tokens.** A personal copy can use
+your own API key from the browser. A public site shouldn't — Google's answer
+is ephemeral tokens minted by a tiny server that holds the key.
+`server/token-server.js` is a reference implementation (Node 18+, no
+dependencies): run it with `GEMINI_API_KEY=… node server/token-server.js`,
+put its URL (`https://your-host/api/token`) into ⚙ Settings → *Realtime token
+endpoint*, and the browser connects to the Live API with short-lived tokens
+locked to the translate model while still choosing the target language
+itself. Put your own authentication and rate limiting in front of it before
+exposing it.
+
+**Wire format, for the curious (and for anyone tempted to "fix" it).** The
+setup message puts `translationConfig` inside `generationConfig`, and
+`inputAudioTranscription` / `outputAudioTranscription` at the *top level* of
+`setup` — that is what the API reference and both official SDKs do. The Live
+Translate guide's own raw-WebSocket sample nests the transcription toggles
+inside `generationConfig`, and the server rejects that shape (close code
+1007). The mock server enforces the correct placement so a regression can't
+slip in. Things the translate model does **not** let you set, so the app
+doesn't offer them: a voice (it replicates the speaker), system instructions
+or glossaries, text input, tools.
+
+The official sample audio from Google's cookbook
+(`https://storage.googleapis.com/generativeai-downloads/gemini-cookbook/audio/gemini-live-translate-sample.wav`,
+~40 s of English narration) is a good first file to try in either mode.
 
 ### Automated tests
 
@@ -129,9 +185,13 @@ resume handle so nothing is lost, and context-window compression lifts the
   source with a speech recording and asserts a translation appears (needs
   `playwright`; see the file header).
 - `test/mock-live.js` + `test/e2e-realtime.js` — realtime mode without an API
-  key: a mock Live API server that speaks the real protocol (setup, audio
-  chunks, transcripts, audio replies, `goAway` + resume), and a test that
-  streams a file and the fake microphone through it and asserts reconnection.
+  key: a mock Live API server that speaks the real protocol (setup validation
+  including field placement, audio chunks, transcripts with language codes,
+  audio replies, `generationComplete`/`turnComplete`, `goAway` + resume,
+  `audioStreamEnd`, a token endpoint, a quota close) and a test covering the
+  file source, make-before-break rollover, pause → `audioStreamEnd`,
+  mid-session retargeting, the fake microphone, token auth, and quota
+  handling.
 - `test/mock-bhashini.js` + `test/e2e-bhashini.js` — Bhashini without
   credentials: a mock of the ULCA config + Dhruva inference endpoints that
   validates request shapes, and a test that runs speech-to-text, translation

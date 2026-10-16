@@ -131,6 +131,8 @@ const settings = {
   micEngine: localStorage.getItem('l10n.micEngine') || 'browser', // 'browser' | 'media'
   bhashiniUserId: localStorage.getItem('l10n.bhashiniUserId') || '',
   bhashiniKey: localStorage.getItem('l10n.bhashiniKey') || '',
+  echoTarget: localStorage.getItem('l10n.echoTarget') === '1',   // realtime: re-speak target-language input
+  tokenEndpoint: localStorage.getItem('l10n.tokenEndpoint') || '', // realtime: ephemeral-token minting URL
 };
 Bhashini.configure({
   userID: settings.bhashiniUserId,
@@ -171,6 +173,8 @@ const el = {
   modeRow: $('modeRow'), modeHint: $('modeHint'),
   micEngineSelect: $('micEngineSelect'), ttsSelect: $('ttsSelect'),
   bhashiniUserInput: $('bhashiniUserInput'), bhashiniKeyInput: $('bhashiniKeyInput'),
+  detectedLang: $('detectedLang'), originalAudio: $('originalAudio'),
+  echoToggle: $('echoToggle'), tokenEndpointInput: $('tokenEndpointInput'),
 };
 
 function setStatus(text) { el.status.textContent = text; }
@@ -195,7 +199,7 @@ populateLangSelect(el.tgtLang, localStorage.getItem('l10n.tgt') || 'hi');
 function onLangChange() {
   localStorage.setItem('l10n.src', el.srcLang.value);
   localStorage.setItem('l10n.tgt', el.tgtLang.value);
-  if (isRealtime()) restartRealtime();
+  if (isRealtime()) retargetRealtime();
   else if (state.listening) restartRecognition();
 }
 el.srcLang.addEventListener('change', onLangChange);
@@ -291,6 +295,7 @@ el.micBtn.addEventListener('click', async () => {
   state.listening = !state.listening;
   updateMicButton();
   if (!state.listening) { stopMic(); return; }
+  acquireWakeLock();
   if (isRealtime()) await startRealtimeMic();
   else if (settings.micEngine === 'media') await startMediaMic();
   else startEngine();
@@ -298,6 +303,7 @@ el.micBtn.addEventListener('click', async () => {
 
 /** Stop whichever microphone path is active. */
 function stopMic() {
+  releaseWakeLock();
   if (isRealtime()) stopRealtimeMic();
   else if (state.micSession) stopMediaMic();
   else { stopEngine(); setStatus('Idle'); }
@@ -397,7 +403,26 @@ el.clearBtn.addEventListener('click', () => {
   el.srcInterim.textContent = '';
   el.tgtInterim.textContent = '';
   el.subtitle.textContent = '';
+  el.detectedLang.textContent = '';
   el.latency.textContent = '';
+});
+
+// Keep the phone awake during a live session (earbud use is hands-off).
+let wakeLock = null;
+async function acquireWakeLock() {
+  if (wakeLock || !navigator.wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch (_) { /* denied or unsupported — not essential */ }
+}
+function releaseWakeLock() {
+  wakeLock?.release().catch(() => {});
+  wakeLock = null;
+}
+document.addEventListener('visibilitychange', () => {
+  const mediaPlaying = state.media && !el.mediaVideo.paused;
+  if (document.visibilityState === 'visible' && (state.listening || mediaPlaying)) acquireWakeLock();
 });
 
 // ---------------------------------------------------------------------------
@@ -420,6 +445,8 @@ function teardownSources() {
     el.mediaVideo.srcObject = null;
   }
   closeRealtime();
+  releaseWakeLock();
+  el.detectedLang.textContent = '';
 }
 
 function setSource(source) {
@@ -538,7 +565,7 @@ el.fileInput.addEventListener('change', async () => {
   try {
     if (isRealtime()) await ensureRealtime();
     state.media = await L10nMedia.openElementSession(el.mediaVideo, mediaSinkOpts());
-    state.media.setOriginalVolume(el.muteOriginal.checked ? 0 : 1);
+    state.media.setOriginalVolume(originalVolume());
     setStatus('Press play to start translating');
     if (!isRealtime()) loadEngine().catch(() => {}); // warm the model while the user hits play
   } catch (err) {
@@ -546,15 +573,29 @@ el.fileInput.addEventListener('change', async () => {
   }
 });
 
-el.muteOriginal.addEventListener('change', () => {
-  if (state.media) state.media.setOriginalVolume(el.muteOriginal.checked ? 0 : 1);
+/** How loud the original soundtrack plays under the translation (1 = full, 0 = dubbed over). */
+const originalVolume = () => parseFloat(el.originalAudio.value);
+el.originalAudio.addEventListener('change', () => {
+  if (state.media) state.media.setOriginalVolume(originalVolume());
 });
 
 el.mediaVideo.addEventListener('play', () => {
-  if (state.media) { state.media.resume(); setStatus(isRealtime() ? 'Live — translating media' : 'Listening to media…'); }
+  if (!state.media) return;
+  state.media.resume();
+  state.media.setMuted(false);
+  acquireWakeLock();
+  if (isRealtime() && !state.rt?.active) setStatus('Realtime session is not connected — fix the error above and reload the file');
+  else setStatus(isRealtime() ? 'Live — translating media' : 'Listening to media…');
 });
-el.mediaVideo.addEventListener('pause', () => state.media?.chunker?.flush());
-el.mediaVideo.addEventListener('ended', () => state.media?.chunker?.flush());
+function onMediaPaused() {
+  if (!state.media) return;
+  state.media.flush();              // push the trailing partial batch (< 100 ms) through
+  state.media.chunker?.flush();
+  state.media.setMuted(true);       // don't stream (or pay for) silence while paused
+  setTimeout(() => state.rt?.endAudioStream(), 80); // after the flushed batch has gone out
+}
+el.mediaVideo.addEventListener('pause', onMediaPaused);
+el.mediaVideo.addEventListener('ended', () => { onMediaPaused(); releaseWakeLock(); });
 
 // --- Browser tab ---------------------------------------------------------------
 el.shareTabBtn.addEventListener('click', async () => {
@@ -627,14 +668,23 @@ el.modeRow.addEventListener('click', (event) => {
 
 async function ensureRealtime() {
   if (state.rt) return state.rt;
-  if (!settings.apiKey) throw new Error('Realtime mode needs a Gemini API key — add it in ⚙ Settings');
+  if (!settings.apiKey && !settings.tokenEndpoint) {
+    throw new Error('Realtime mode needs a Gemini API key (or a token endpoint) — add it in ⚙ Settings');
+  }
+  const tgt = el.tgtLang.value;
+  if (!RealtimeTranslator.supports(tgt)) {
+    throw new Error(`Gemini Live Translate doesn't support ${langByCode(tgt)?.name || tgt} yet — use the chunked pipeline (Bhashini covers it)`);
+  }
   const rt = new RealtimeTranslator({
     apiKey: settings.apiKey,
-    targetLang: el.tgtLang.value,
+    tokenEndpoint: settings.tokenEndpoint || undefined,
+    targetLang: tgt,
+    echoTargetLanguage: settings.echoTarget,
     audioContext: L10nMedia.getAudioContext(),
     endpoint: new URLSearchParams(location.search).get('rtEndpoint') || undefined, // test hook
     onStatus: setStatus,
-    onInputText: (text, final) => {
+    onInputText: (text, final, lang) => {
+      if (lang) el.detectedLang.textContent = `heard: ${languageName(lang)}`;
       if (final) { appendLine(el.srcFinal, text); el.srcInterim.textContent = ''; }
       else el.srcInterim.textContent = text;
     },
@@ -642,6 +692,9 @@ async function ensureRealtime() {
       el.subtitle.textContent = text;
       if (final) { appendLine(el.tgtFinal, text); el.tgtInterim.textContent = ''; }
       else el.tgtInterim.textContent = text;
+    },
+    onUsage: ({ secondsIn, secondsOut, estCostUsd }) => {
+      el.latency.textContent = `live: ${fmtSeconds(secondsIn)} in · ${fmtSeconds(secondsOut)} out · ≈$${estCostUsd.toFixed(3)} paid tier`;
     },
     onError: (err) => appendLine(el.tgtFinal, `⚠ ${err.message}`, true),
   });
@@ -656,13 +709,24 @@ async function ensureRealtime() {
   return rt;
 }
 
+function languageName(code) {
+  try { return new Intl.DisplayNames(['en'], { type: 'language' }).of(code) || code; } catch (_) { return code; }
+}
+
+function fmtSeconds(s) {
+  const m = Math.floor(s / 60), r = Math.floor(s % 60);
+  return m ? `${m}m${String(r).padStart(2, '0')}s` : `${r}s`;
+}
+
 function closeRealtime() {
+  clearTimeout(state.rtDrainTimer);
   if (state.rt) { state.rt.close(); state.rt = null; }
 }
 
 const rtSink = (samples) => state.rt?.sendSamples(samples);
 
 async function startRealtimeMic() {
+  clearTimeout(state.rtDrainTimer);
   try {
     await ensureRealtime();
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -686,15 +750,28 @@ function stopRealtimeMic() {
     state.rtMic.stream.getTracks().forEach((t) => t.stop());
     state.rtMic = null;
   }
-  closeRealtime();
-  setStatus('Idle');
+  // Tell the model the input ended and keep the session open briefly so the
+  // translation of the last sentence can still arrive and play.
+  if (state.rt?.active) {
+    state.rt.endAudioStream();
+    setStatus('Finishing the last translation…');
+    clearTimeout(state.rtDrainTimer);
+    state.rtDrainTimer = setTimeout(() => { closeRealtime(); setStatus('Idle'); }, 3000);
+  } else {
+    closeRealtime();
+    setStatus('Idle');
+  }
 }
 
-/** The target language is fixed at session setup, so a change means reconnecting. */
-async function restartRealtime() {
+/** Target language changed: the live session keeps its context and switches on the fly. */
+function retargetRealtime() {
   if (!state.rt) return;
-  closeRealtime();
-  try { await ensureRealtime(); } catch (err) { appendLine(el.tgtFinal, `⚠ ${err.message}`, true); }
+  const tgt = el.tgtLang.value;
+  if (!RealtimeTranslator.supports(tgt)) {
+    appendLine(el.tgtFinal, `⚠ Gemini Live Translate doesn't support ${langByCode(tgt)?.name || tgt} — still translating to the previous language`, true);
+    return;
+  }
+  state.rt.setTargetLang(tgt);
 }
 
 el.speakToggle.addEventListener('change', () => state.rt?.setPlayback(el.speakToggle.checked));
@@ -869,6 +946,8 @@ el.settingsBtn.addEventListener('click', () => {
   el.bhashiniUserInput.value = settings.bhashiniUserId;
   el.bhashiniKeyInput.value = settings.bhashiniKey;
   el.ttsSelect.value = settings.tts;
+  el.echoToggle.checked = settings.echoTarget;
+  el.tokenEndpointInput.value = settings.tokenEndpoint;
   refreshVoices();
   el.settingsDialog.showModal();
 });
@@ -880,13 +959,18 @@ el.settingsSave.addEventListener('click', () => {
   settings.tts = el.ttsSelect.value;
   settings.bhashiniUserId = el.bhashiniUserInput.value.trim();
   settings.bhashiniKey = el.bhashiniKeyInput.value.trim();
+  settings.echoTarget = el.echoToggle.checked;
+  settings.tokenEndpoint = el.tokenEndpointInput.value.trim();
   localStorage.setItem('l10n.provider', settings.provider);
   localStorage.setItem('l10n.apiKey', settings.apiKey);
   localStorage.setItem('l10n.voiceURI', settings.voiceURI);
   localStorage.setItem('l10n.tts', settings.tts);
   localStorage.setItem('l10n.bhashiniUserId', settings.bhashiniUserId);
   localStorage.setItem('l10n.bhashiniKey', settings.bhashiniKey);
+  localStorage.setItem('l10n.echoTarget', settings.echoTarget ? '1' : '0');
+  localStorage.setItem('l10n.tokenEndpoint', settings.tokenEndpoint);
   Bhashini.configure({ userID: settings.bhashiniUserId, ulcaApiKey: settings.bhashiniKey });
+  state.rt?.setEchoTargetLanguage(settings.echoTarget);
   el.settingsDialog.close();
 });
 
