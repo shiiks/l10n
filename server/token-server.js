@@ -20,6 +20,7 @@ const PORT = Number(process.env.PORT || 8787);
 const ORIGIN = process.env.ALLOW_ORIGIN || '*';
 const MODEL = process.env.MODEL || 'gemini-3.5-live-translate-preview';
 const PER_MINUTE = Number(process.env.TOKENS_PER_MINUTE_PER_IP || 10);
+const TRUST_PROXY = process.env.TRUST_PROXY === '1'; // only honour X-Forwarded-For behind your own proxy
 
 if (!KEY) { console.error('GEMINI_API_KEY is required'); process.exit(1); }
 
@@ -41,16 +42,17 @@ async function mintToken() {
     expireTime: new Date(now + 30 * 60 * 1000).toISOString(),
     newSessionExpireTime: new Date(now + 2 * 60 * 1000).toISOString(),
     // API-reference wire shape (what the official SDKs send): lock these
-    // setup fields; everything else — notably translationConfig — comes
-    // from the page's own setup message.
+    // setup fields; everything else comes from the page's own setup message —
+    // notably translationConfig (the page picks the language) and
+    // sessionResumption (a locked `{}` would overwrite the page's resume
+    // handle on every reconnect and fork the session).
     bidiGenerateContentSetup: {
       model: `models/${MODEL}`,
       generationConfig: { responseModalities: ['AUDIO'] },
       inputAudioTranscription: {},
       outputAudioTranscription: {},
-      sessionResumption: {},
     },
-    fieldMask: 'model,generationConfig.responseModalities,inputAudioTranscription,outputAudioTranscription,sessionResumption',
+    fieldMask: 'model,generationConfig.responseModalities,inputAudioTranscription,outputAudioTranscription',
   };
   const res = await fetch('https://generativelanguage.googleapis.com/v1beta/auth_tokens', {
     method: 'POST',
@@ -66,13 +68,15 @@ const cors = {
   'Access-Control-Allow-Origin': ORIGIN,
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'content-type',
+  // Cookie-based auth across origins needs a specific origin, never '*'.
+  ...(ORIGIN !== '*' ? { 'Access-Control-Allow-Credentials': 'true' } : {}),
 };
 
 http.createServer(async (req, res) => {
   const json = (code, obj) => { res.writeHead(code, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
   if (req.method === 'OPTIONS') { res.writeHead(204, cors); return res.end(); }
   if (req.method !== 'POST' || req.url !== '/api/token') return json(404, { error: 'not found' });
-  const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress;
+  const ip = (TRUST_PROXY && req.headers['x-forwarded-for']?.split(',')[0].trim()) || req.socket.remoteAddress;
   if (rateLimited(ip)) return json(429, { error: 'too many tokens requested, try again in a minute' });
   try {
     json(200, await mintToken());

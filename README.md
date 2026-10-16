@@ -131,8 +131,10 @@ their own translate bridge:
   the same session.
 - **Changing the target language mid-session** keeps the session (config may
   change on resume) instead of starting over.
-- `audioStreamEnd` is sent whenever input pauses — a paused video, a muted
-  mic, a stalled tab — so the model flushes what it has instead of waiting.
+- `audioStreamEnd` is sent whenever input pauses — a paused video, a stopped
+  mic, a stalled tab — so the model flushes what it has instead of waiting;
+  stopping the mic keeps the session open until the last translation has
+  arrived and finished playing.
 - Transcripts finalize on `generationComplete`, `turnComplete`, interruption,
   *or* a two-second gap, because the continuous translate model doesn't
   always mark turns.
@@ -186,12 +188,14 @@ The official sample audio from Google's cookbook
   `playwright`; see the file header).
 - `test/mock-live.js` + `test/e2e-realtime.js` — realtime mode without an API
   key: a mock Live API server that speaks the real protocol (setup validation
-  including field placement, audio chunks, transcripts with language codes,
-  audio replies, `generationComplete`/`turnComplete`, `goAway` + resume,
-  `audioStreamEnd`, a token endpoint, a quota close) and a test covering the
-  file source, make-before-break rollover, pause → `audioStreamEnd`,
-  mid-session retargeting, the fake microphone, token auth, and quota
-  handling.
+  including field placement and the supported-language table, audio chunks,
+  transcripts with language codes, audio replies,
+  `generationComplete`/`turnComplete`, `goAway` + resume, `audioStreamEnd`,
+  a late final sentence after the input ends, a token endpoint, a quota
+  close) and a test covering the file source, make-before-break rollover
+  with the status wording intact, pause → `audioStreamEnd`, mid-session
+  retargeting with code mapping (`zh-CN` → `zh-Hans`), the fake microphone
+  with a drained stop, token auth, and quota handling with recovery.
 - `test/mock-bhashini.js` + `test/e2e-bhashini.js` — Bhashini without
   credentials: a mock of the ULCA config + Dhruva inference endpoints that
   validates request shapes, and a test that runs speech-to-text, translation

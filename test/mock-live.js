@@ -24,6 +24,8 @@ const RECYCLE_AT = Number(process.env.RECYCLE_AT || 25);
 const CLOSE_DELAY_MS = Number(process.env.CLOSE_DELAY_MS || 1500);
 const HANDLE = 'resume-handle-1';
 const TOKEN = 'mock-ephemeral-token';
+// Target codes the real translate model documents (same table the client uses).
+const SUPPORTED = new Set(['af', 'ak', 'sq', 'am', 'ar', 'hy', 'az', 'eu', 'be', 'bn', 'bg', 'my', 'ca', 'zh-Hans', 'zh-Hant', 'hr', 'cs', 'da', 'nl', 'en', 'et', 'fil', 'fi', 'fr', 'gl', 'ka', 'de', 'el', 'gu', 'ha', 'he', 'hi', 'hu', 'is', 'id', 'it', 'ja', 'jv', 'kn', 'kk', 'km', 'rw', 'ko', 'lo', 'lv', 'lt', 'mk', 'ms', 'ml', 'mr', 'mn', 'ne', 'no', 'nb', 'fa', 'pl', 'pt-BR', 'pt-PT', 'pa', 'ro', 'ru', 'sr', 'sd', 'si', 'sk', 'sl', 'es', 'su', 'sw', 'sv', 'ta', 'te', 'th', 'tr', 'uk', 'ur', 'uz', 'vi', 'zu']);
 
 function tonePcm24k(seconds, hz = 440) {
   const n = Math.round(24000 * seconds);
@@ -87,6 +89,11 @@ wss.on('connection', (ws, req) => {
         ws.close(1007, 'invalid setup');
         return;
       }
+      if (!SUPPORTED.has(tc.targetLanguageCode)) {
+        log(`unsupported target ${tc.targetLanguageCode}`);
+        ws.close(1007, `unsupported target language ${tc.targetLanguageCode}`);
+        return;
+      }
       rec.target = tc.targetLanguageCode;
       rec.echo = !!tc.echoTargetLanguage;
       rec.resumed = s.sessionResumption?.handle === HANDLE;
@@ -103,6 +110,17 @@ wss.on('connection', (ws, req) => {
     if (msg.realtimeInput?.audioStreamEnd) {
       rec.audioStreamEnds++;
       log('audioStreamEnd');
+      if (key === 'slow-key') {
+        // Like the real model finishing the last sentence after the input
+        // ended: transcript + 2 s of audio, late, and with no completion flag.
+        setTimeout(() => {
+          send({ serverContent: { inputTranscription: { text: 'late final sentence ', languageCode: 'en' } } });
+          send({ serverContent: {
+            modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: tonePcm24k(2.0, 330) } }] },
+            outputTranscription: { text: 'late final translation', languageCode: rec.target },
+          } });
+        }, 1200);
+      }
       return;
     }
 

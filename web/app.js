@@ -409,14 +409,19 @@ el.clearBtn.addEventListener('click', () => {
 
 // Keep the phone awake during a live session (earbud use is hands-off).
 let wakeLock = null;
+let wakeGen = 0;
 async function acquireWakeLock() {
   if (wakeLock || !navigator.wakeLock) return;
+  const gen = ++wakeGen;
   try {
-    wakeLock = await navigator.wakeLock.request('screen');
-    wakeLock.addEventListener('release', () => { wakeLock = null; });
+    const lock = await navigator.wakeLock.request('screen');
+    if (gen !== wakeGen) { lock.release().catch(() => {}); return; } // released while the request was pending
+    wakeLock = lock;
+    lock.addEventListener('release', () => { if (wakeLock === lock) wakeLock = null; });
   } catch (_) { /* denied or unsupported — not essential */ }
 }
 function releaseWakeLock() {
+  wakeGen++;
   wakeLock?.release().catch(() => {});
   wakeLock = null;
 }
@@ -569,7 +574,7 @@ el.fileInput.addEventListener('change', async () => {
     setStatus('Press play to start translating');
     if (!isRealtime()) loadEngine().catch(() => {}); // warm the model while the user hits play
   } catch (err) {
-    appendLine(el.tgtFinal, `⚠ Could not capture audio: ${err.message}`, true);
+    if (!err.cancelled) appendLine(el.tgtFinal, `⚠ Could not capture audio: ${err.message}`, true);
   }
 });
 
@@ -579,20 +584,32 @@ el.originalAudio.addEventListener('change', () => {
   if (state.media) state.media.setOriginalVolume(originalVolume());
 });
 
-el.mediaVideo.addEventListener('play', () => {
+el.mediaVideo.addEventListener('play', async () => {
   if (!state.media) return;
   state.media.resume();
   state.media.setMuted(false);
   acquireWakeLock();
-  if (isRealtime() && !state.rt?.active) setStatus('Realtime session is not connected — fix the error above and reload the file');
-  else setStatus(isRealtime() ? 'Live — translating media' : 'Listening to media…');
+  if (isRealtime() && !state.rt?.active) {
+    // The session gave up earlier (quota, repeated failures): pressing play retries.
+    setStatus('Reconnecting the realtime session…');
+    try {
+      await ensureRealtime();
+    } catch (err) {
+      if (!err.cancelled) appendLine(el.tgtFinal, `⚠ ${err.message}`, true);
+      setStatus('Realtime session is not connected — fix the error above and press play again');
+      return;
+    }
+  }
+  setStatus(isRealtime() ? liveWording() : 'Listening to media…');
 });
-function onMediaPaused() {
-  if (!state.media) return;
-  state.media.flush();              // push the trailing partial batch (< 100 ms) through
-  state.media.chunker?.flush();
-  state.media.setMuted(true);       // don't stream (or pay for) silence while paused
-  setTimeout(() => state.rt?.endAudioStream(), 80); // after the flushed batch has gone out
+async function onMediaPaused() {
+  const media = state.media;
+  if (!media) return;
+  await media.flush();              // deliver the trailing partial batch (< 100 ms) first
+  if (state.media !== media || !el.mediaVideo.paused) return; // resumed or torn down meanwhile
+  media.chunker?.flush();
+  media.setMuted(true);             // don't stream (or pay for) silence while paused
+  state.rt?.endAudioStream();       // let the model flush what it has
 }
 el.mediaVideo.addEventListener('pause', onMediaPaused);
 el.mediaVideo.addEventListener('ended', () => { onMediaPaused(); releaseWakeLock(); });
@@ -627,7 +644,7 @@ el.shareTabBtn.addEventListener('click', async () => {
     setStatus(isRealtime() ? 'Live — translating tab' : 'Listening to tab…');
     if (!isRealtime()) loadEngine().catch(() => {});
   } catch (err) {
-    appendLine(el.tgtFinal, `⚠ Could not capture tab audio: ${err.message}`, true);
+    if (!err.cancelled) appendLine(el.tgtFinal, `⚠ Could not capture tab audio: ${err.message}`, true);
   }
   stream.getVideoTracks()[0]?.addEventListener('ended', () => {
     closeMediaSession();
@@ -661,13 +678,15 @@ el.modeRow.addEventListener('click', (event) => {
   if (!btn || btn.dataset.mode === settings.mode) return;
   unlockTTS();
   teardownSources();
+  setStatus('Idle');
   settings.mode = btn.dataset.mode;
   localStorage.setItem('l10n.mode', settings.mode);
   applyMode();
 });
 
 async function ensureRealtime() {
-  if (state.rt) return state.rt;
+  if (state.rt?.active) return state.rt;
+  if (state.rt) closeRealtime(); // gave up (quota, repeated failures): start over
   if (!settings.apiKey && !settings.tokenEndpoint) {
     throw new Error('Realtime mode needs a Gemini API key (or a token endpoint) — add it in ⚙ Settings');
   }
@@ -682,7 +701,7 @@ async function ensureRealtime() {
     echoTargetLanguage: settings.echoTarget,
     audioContext: L10nMedia.getAudioContext(),
     endpoint: new URLSearchParams(location.search).get('rtEndpoint') || undefined, // test hook
-    onStatus: setStatus,
+    onStatus: (s) => setStatus(s === 'Live' ? liveWording() : s),
     onInputText: (text, final, lang) => {
       if (lang) el.detectedLang.textContent = `heard: ${languageName(lang)}`;
       if (final) { appendLine(el.srcFinal, text); el.srcInterim.textContent = ''; }
@@ -703,10 +722,21 @@ async function ensureRealtime() {
   try {
     await rt.connect();
   } catch (err) {
-    state.rt = null;
+    if (state.rt === rt) state.rt = null;
     throw err;
   }
+  if (state.rt !== rt) { // torn down while connecting
+    rt.close();
+    throw Object.assign(new Error('cancelled'), { cancelled: true });
+  }
   return rt;
+}
+
+/** The app owns the "live" wording; the client only reports that a socket is ready. */
+function liveWording() {
+  if (state.source === 'file') return el.mediaVideo.paused ? 'Live — press play to translate' : 'Live — translating media';
+  if (state.source === 'tab') return 'Live — translating tab';
+  return 'Live — speak now';
 }
 
 function languageName(code) {
@@ -719,44 +749,60 @@ function fmtSeconds(s) {
 }
 
 function closeRealtime() {
-  clearTimeout(state.rtDrainTimer);
   if (state.rt) { state.rt.close(); state.rt = null; }
 }
 
 const rtSink = (samples) => state.rt?.sendSamples(samples);
 
+function stopMicCapture() {
+  if (!state.rtMic) return;
+  state.rtMic.session.close();
+  state.rtMic.stream.getTracks().forEach((t) => t.stop());
+  state.rtMic = null;
+}
+
 async function startRealtimeMic() {
-  clearTimeout(state.rtDrainTimer);
+  state.rt?.cancelDrain(); // restarted inside the drain: keep the session
+  let stream, session;
+  const bail = () => { session?.close(); stream?.getTracks().forEach((t) => t.stop()); };
   try {
     await ensureRealtime();
-    const stream = await navigator.mediaDevices.getUserMedia({
+    if (!state.listening) return; // stopped while connecting
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
-    const session = await L10nMedia.openStreamSession(stream, { onSamples: rtSink });
+    if (!state.listening) { bail(); return; }
+    session = await L10nMedia.openStreamSession(stream, { onSamples: rtSink });
     await session.resume();
+    if (!state.listening) { bail(); return; }
+    stopMicCapture();
     state.rtMic = { stream, session };
+    setStatus(liveWording());
   } catch (err) {
+    bail();
+    if (err.cancelled) return;
     appendLine(el.tgtFinal, `⚠ ${err.message}`, true);
     state.listening = false;
     updateMicButton();
     closeRealtime();
+    releaseWakeLock();
     setStatus('Idle');
   }
 }
 
 function stopRealtimeMic() {
-  if (state.rtMic) {
-    state.rtMic.session.close();
-    state.rtMic.stream.getTracks().forEach((t) => t.stop());
-    state.rtMic = null;
-  }
-  // Tell the model the input ended and keep the session open briefly so the
-  // translation of the last sentence can still arrive and play.
-  if (state.rt?.active) {
-    state.rt.endAudioStream();
+  stopMicCapture();
+  const rt = state.rt;
+  if (rt?.active && rt.ready) {
+    // Tell the model the input ended, then keep the session open until the
+    // translation of the last sentence has arrived and finished playing.
+    rt.endAudioStream();
     setStatus('Finishing the last translation…');
-    clearTimeout(state.rtDrainTimer);
-    state.rtDrainTimer = setTimeout(() => { closeRealtime(); setStatus('Idle'); }, 3000);
+    rt.drain().then(() => {
+      if (state.rt !== rt || state.listening) return; // restarted or torn down meanwhile
+      closeRealtime();
+      setStatus('Idle');
+    });
   } else {
     closeRealtime();
     setStatus('Idle');

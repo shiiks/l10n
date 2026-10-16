@@ -93,7 +93,13 @@ const L10nMedia = (() => {
     const chunker = opts.onChunk ? new SpeechChunker(opts) : null;
     const capture = new AudioWorkletNode(ctx, 'pcm-capture');
     let muted = false;
+    let flushWaiters = [];
     capture.port.onmessage = (event) => {
+      if (event.data?.type === 'flushed') {
+        const waiters = flushWaiters; flushWaiters = [];
+        waiters.forEach((resolve) => resolve());
+        return;
+      }
       if (muted) return;
       if (opts.onSamples) opts.onSamples(event.data);
       if (chunker) chunker.push(event.data);
@@ -113,8 +119,14 @@ const L10nMedia = (() => {
       setOriginalVolume(v) { if (gain) gain.gain.value = v; },
       /** Drop captured audio (e.g. while the app itself is speaking). */
       setMuted(v) { muted = v; if (v && chunker) chunker.reset(); },
-      /** Push the worklet's pending partial batch through now. */
-      flush() { capture.port.postMessage('flush'); },
+      /** Push the worklet's pending partial batch through; resolves once it has been delivered. */
+      flush() {
+        return new Promise((resolve) => {
+          flushWaiters.push(resolve);
+          capture.port.postMessage('flush');
+          setTimeout(resolve, 250); // never block a caller on a silent worklet
+        });
+      },
       close() {
         if (chunker) chunker.flush();
         try { sourceNode.disconnect(capture); } catch (_) {}

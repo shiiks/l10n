@@ -11,7 +11,8 @@
  *    sessionResumption and contextWindowCompression are top-level setup keys.
  *  - Connections are recycled every ~10 min: the server sends goAway, then
  *    closes. We open the replacement socket on goAway with the resume handle
- *    and swap once it's ready (make-before-break), like Google's own bridge.
+ *    and swap once it's ready (make-before-break), like Google's own bridge;
+ *    the retiring socket keeps delivering its last sentence meanwhile.
  *  - The translate model is a continuous interpreter and may not send
  *    turnComplete reliably, so transcripts are also finalized on
  *    generationComplete, interrupted, and after a silence gap.
@@ -29,6 +30,7 @@ class RealtimeTranslator {
   static REST = 'https://generativelanguage.googleapis.com/v1beta';
   static INPUT_RATE = 16000;
   static OUTPUT_RATE = 24000;
+  static CONNECT_TIMEOUT_MS = 15000;
   static HANDLE_TTL_MS = 2 * 60 * 60 * 1000; // resume handles stay valid for 2 h
   static TOKENS_PER_SECOND = 25;              // audio tokenization rate (both directions)
   static PRICE_PER_M = { input: 3.5, output: 21 }; // paid tier USD; free tier is $0
@@ -49,15 +51,16 @@ class RealtimeTranslator {
   /**
    * @param {object} opts
    * @param {string} [opts.apiKey]            Gemini API key (browser-side; fine for a personal tool)
-   * @param {string} [opts.tokenEndpoint]     URL that POSTs back {token} — an ephemeral token minted
-   *                                          server-side; used instead of apiKey when set
+   * @param {string} [opts.tokenEndpoint]     URL that POSTs back {token, expires_at} — an ephemeral
+   *                                          token minted server-side; used instead of apiKey when set
    * @param {string} opts.targetLang          app language code, e.g. 'hi', 'zh-CN'
    * @param {boolean} [opts.echoTargetLanguage=false]  re-speak input already in the target language
    * @param {AudioContext} opts.audioContext  used to play the returned speech
    * @param {string} [opts.model]
    * @param {string} [opts.endpoint]          override for testing against a mock (used for both modes)
-   * @param {boolean} [opts.persistHandle=true]  keep the resume handle in sessionStorage across reloads
-   * @param {(status: string) => void} [opts.onStatus]
+   * @param {boolean} [opts.persistHandle=true]  keep the resume handle in sessionStorage so a page
+   *                                          reload continues the session (an explicit close() ends it)
+   * @param {(status: string) => void} [opts.onStatus]   'Live' once a socket is ready; wording is the app's
    * @param {(text: string, final: boolean, lang?: string) => void} [opts.onInputText]   what the model heard
    * @param {(text: string, final: boolean, lang?: string) => void} [opts.onOutputText]  what it said
    * @param {(usage: {secondsIn:number, secondsOut:number, tokens:number, estCostUsd:number}) => void} [opts.onUsage]
@@ -70,13 +73,19 @@ class RealtimeTranslator {
     this.endpoint = opts.endpoint || null;
 
     this.ws = null;           // active socket
+    this.retiring = null;     // old socket still delivering its last sentence after a goAway swap
+    this.opening = null;      // socket whose setup is in flight
     this.ready = false;
     this.active = false;      // user intent: keep the session alive
+    this.closed = false;      // close() ran: callbacks go quiet
+    this.gen = 0;             // bumped by close(); in-flight opens from an older gen are discarded
     this.rollingOver = false;
     this.rolloverAgain = false;
-    this.resumeHandle = null;
+    this.reconnectTimer = null;
     this.reconnectAttempts = 0;
+    this.resumeHandle = null;
     this.setupMode = 'full';  // 'full' | 'noHandle' | 'minimal' — degrades if setup is rejected
+    this.token = null;        // { value, expiresAt } cached ephemeral token
 
     this.inText = ''; this.inLang = '';
     this.outText = ''; this.outLang = '';
@@ -85,6 +94,7 @@ class RealtimeTranslator {
     this.streaming = false;   // audio sent since the last audioStreamEnd
     this.lastSendAt = 0;
     this.watchdog = null;
+    this.drainState = null;   // { resolve, timer, idleTimer, received, completed }
 
     this.gain = this.ctx.createGain();
     this.gain.connect(this.ctx.destination);
@@ -103,8 +113,11 @@ class RealtimeTranslator {
   // ---------------------------------------------------------------------------
   async connect() {
     this.active = true;
+    const gen = this.gen;
     await this._preflight();
-    this.ws = await this._openWithFallback();
+    const ws = await this._openWithFallback();
+    if (gen !== this.gen || !this.active) { try { ws.close(1000, 'client closed'); } catch (_) {} return; }
+    this.ws = ws;
     this._afterSocketReady();
   }
 
@@ -124,15 +137,27 @@ class RealtimeTranslator {
 
   async _credentials() {
     if (this.opts.tokenEndpoint) {
-      const res = await fetch(this.opts.tokenEndpoint, { method: 'POST' });
-      if (!res.ok) throw new Error(`Token endpoint returned ${res.status}`);
-      const data = await res.json();
-      if (!data.token) throw new Error('Token endpoint returned no token');
+      // Reuse a token while it's valid: resuming a session doesn't consume a
+      // use, and a fresh token per reconnect would fork the session's identity.
+      if (!this.token || this.token.expiresAt - Date.now() < 60000) {
+        // Default credentials mode: cookies reach a same-origin token endpoint,
+        // and a cross-origin one that answers with '*' still works.
+        const res = await fetch(this.opts.tokenEndpoint, { method: 'POST' });
+        if (!res.ok) throw new Error(`Token endpoint returned ${res.status}`);
+        const data = await res.json();
+        if (!data.token) throw new Error('Token endpoint returned no token');
+        const expiresAt = Date.parse(data.expires_at || data.expiresAt || '') || Date.now() + 25 * 60 * 1000;
+        this.token = { value: data.token, expiresAt };
+      }
       const base = this.endpoint || RealtimeTranslator.CONSTRAINED_ENDPOINT;
-      return `${base}${base.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(data.token)}`;
+      return `${base}${base.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(this.token.value)}`;
     }
     const base = this.endpoint || RealtimeTranslator.ENDPOINT;
     return `${base}${base.includes('?') ? '&' : '?'}key=${encodeURIComponent(this.opts.apiKey || '')}`;
+  }
+
+  static _cancelled() {
+    return Object.assign(new Error('session closed'), { cancelled: true, code: 0 });
   }
 
   /**
@@ -144,10 +169,11 @@ class RealtimeTranslator {
   async _openWithFallback() {
     let transientTries = 0;
     for (;;) {
+      if (!this.active) throw RealtimeTranslator._cancelled();
       try {
         return await this._openSocket();
       } catch (err) {
-        if (!this.active) throw err;
+        if (err.cancelled || !this.active) throw err;
         if (err.code === 1007) {
           if (this.setupMode === 'full' && this.resumeHandle) {
             this.resumeHandle = null;
@@ -171,37 +197,66 @@ class RealtimeTranslator {
   }
 
   _openSocket() {
-    return new Promise(async (resolve, reject) => {
-      let url;
-      try { url = await this._credentials(); } catch (err) { reject(err); return; }
-      const ws = new WebSocket(url);
-      ws.binaryType = 'arraybuffer'; // decoded synchronously, so message order is preserved
-      ws._setupDone = false;
-      this._status(this.resumeHandle ? 'Reconnecting…' : 'Connecting…');
+    const gen = this.gen;
+    return new Promise((resolve, reject) => {
+      this._credentials().then((url) => {
+        if (gen !== this.gen || !this.active) { reject(RealtimeTranslator._cancelled()); return; }
+        let ws;
+        try { ws = new WebSocket(url); } catch (err) { reject(err); return; }
+        ws.binaryType = 'arraybuffer'; // decoded synchronously, so message order is preserved
+        ws._setupDone = false;
+        ws._config = null;
+        this.opening = ws;
+        this._status(this.resumeHandle ? 'Reconnecting…' : 'Connecting…');
 
-      ws.onopen = () => ws.send(JSON.stringify(this._setupMessage()));
-      ws.onmessage = (event) => {
-        const msg = RealtimeTranslator._parse(event.data);
-        if (!msg) return;
-        if (msg.setupComplete !== undefined && !ws._setupDone) {
-          ws._setupDone = true;
-          resolve(ws);
-          return;
-        }
-        if (ws === this.ws) this._handle(msg);
-        else if (msg.sessionResumptionUpdate) this._handle({ sessionResumptionUpdate: msg.sessionResumptionUpdate });
-        // Anything else from a socket that isn't (or no longer is) the active one is ignored.
-      };
-      ws.onerror = () => { /* onclose carries the detail */ };
-      ws.onclose = (event) => {
-        if (!ws._setupDone) {
-          const err = new Error(RealtimeTranslator.describeClose(event, 'setup rejected'));
-          err.code = event.code;
-          reject(err);
-          return;
-        }
-        if (ws === this.ws) this._onActiveClose(event);
-      };
+        const settle = () => {
+          clearTimeout(timeout);
+          if (this.opening === ws) this.opening = null;
+        };
+        const timeout = setTimeout(() => {
+          if (ws._setupDone) return;
+          try { ws.close(1000, 'connect timeout'); } catch (_) {}
+          settle();
+          reject(Object.assign(new Error('Live API did not answer within 15 s'), { code: 0 }));
+        }, RealtimeTranslator.CONNECT_TIMEOUT_MS);
+
+        ws.onopen = () => {
+          ws._config = { target: this.opts.targetLang, echo: !!this.opts.echoTargetLanguage };
+          ws.send(JSON.stringify(this._setupMessage()));
+        };
+        ws.onmessage = (event) => {
+          const msg = RealtimeTranslator._parse(event.data);
+          if (!msg) return;
+          if (msg.setupComplete !== undefined && !ws._setupDone) {
+            ws._setupDone = true;
+            settle();
+            if (gen !== this.gen || !this.active) {
+              try { ws.close(1000, 'client closed'); } catch (_) {}
+              reject(RealtimeTranslator._cancelled());
+              return;
+            }
+            resolve(ws);
+            return;
+          }
+          if (ws === this.ws) this._handle(msg);
+          else if (ws === this.retiring) this._handle(msg, true);
+          else if (msg.sessionResumptionUpdate) this._handle({ sessionResumptionUpdate: msg.sessionResumptionUpdate });
+          // Anything else from a socket that isn't (or no longer is) the active one is ignored.
+        };
+        ws.onerror = () => { /* onclose carries the detail */ };
+        ws.onclose = (event) => {
+          if (!ws._setupDone) {
+            settle();
+            const err = new Error(RealtimeTranslator.describeClose(event, 'setup rejected'));
+            err.code = event.code;
+            err.cancelled = gen !== this.gen || !this.active;
+            reject(err);
+            return;
+          }
+          if (ws === this.ws) this._onActiveClose(event);
+          else if (ws === this.retiring) this._retireDone();
+        };
+      }, reject);
     });
   }
 
@@ -213,14 +268,20 @@ class RealtimeTranslator {
   _afterSocketReady() {
     this.ready = true;
     this.reconnectAttempts = 0;
-    this.setupMode = 'full';
+    // A server that rejected the optional fields keeps rejecting them: stay minimal.
+    this.setupMode = this.setupMode === 'minimal' ? 'minimal' : 'full';
     this.streaming = false;
-    this._status('Live — speak now');
+    this._status('Live');
     if (!this.watchdog) {
       // Input that stalls for >1 s must be flushed with audioStreamEnd.
       this.watchdog = setInterval(() => {
         if (this.ready && this.streaming && performance.now() - this.lastSendAt > 1200) this.endAudioStream();
       }, 400);
+    }
+    // Settings changed while this socket was connecting: its setup is stale.
+    const c = this.ws._config;
+    if (c && (c.target !== this.opts.targetLang || c.echo !== !!this.opts.echoTargetLanguage)) {
+      this._rollover('settings changed');
     }
   }
 
@@ -248,34 +309,64 @@ class RealtimeTranslator {
     return { setup };
   }
 
-  /** Open the replacement socket now (with the resume handle) and swap when it's ready. */
-  async _rollover(reason) {
+  /**
+   * Open the replacement socket now (with the resume handle) and swap when
+   * it's ready. On a server-initiated recycle the old socket is kept as
+   * `retiring` so the sentence it was translating still arrives; on a
+   * settings change it is closed at once.
+   */
+  async _rollover(reason, { graceful = false } = {}) {
     if (!this.active) return;
     if (this.rollingOver) { this.rolloverAgain = true; return; } // config changed mid-swap: run once more after
     this.rollingOver = true;
     const old = this.ws;
     try {
-      const next = await this._openSocket();
-      if (!this.active) { next.close(1000, 'client closed'); return; }
+      const next = await this._openWithFallback();
+      if (!this.active) { try { next.close(1000, 'client closed'); } catch (_) {} return; }
       this.ws = next;
       this.stats.rollovers++;
       if (old && old !== next) {
-        old.onclose = old.onerror = old.onmessage = null;
-        try { old.close(1000, reason); } catch (_) {}
+        if (graceful) this._retire(old);
+        else { old.onclose = old.onerror = old.onmessage = null; try { old.close(1000, reason); } catch (_) {} }
       }
       this._afterSocketReady();
     } catch (err) {
-      if (!this.ws) {
-        // The old socket died while the replacement was connecting: fall
-        // back to the ordinary reconnect path instead of staying silent.
-        this._scheduleReconnect({ code: 0, reason: err.message });
+      if (err.cancelled || !this.active) return;
+      if (this.ws) {
+        // The old socket is healthy but the new settings never took effect:
+        // close it so the ordinary reconnect applies them (it reads current opts).
+        this._error(new Error(`Could not switch settings on the live session (${err.message}) — reconnecting`));
+        const stale = this.ws;
+        try { stale.close(1000, reason); } catch (_) {}
       } else {
-        this._status(`Reconnect ahead of time failed (${err.message}) — will retry on close`);
+        // The old socket died while the replacement was connecting.
+        this._scheduleReconnect({ code: 0, reason: err.message });
       }
     } finally {
       this.rollingOver = false;
-      if (this.rolloverAgain) { this.rolloverAgain = false; this._rollover('settings changed'); }
+      if (this.rolloverAgain) {
+        this.rolloverAgain = false;
+        // With no live socket the reconnect path (already armed) applies the
+        // current opts; a second opener here would race it.
+        if (this.ws) this._rollover('settings changed');
+      }
     }
+  }
+
+  _retire(ws) {
+    if (this.retiring) this._retireDone();
+    this.retiring = ws;
+    ws.onerror = null;
+    this.retireTimer = setTimeout(() => { if (this.retiring === ws) this._retireDone(); }, 6000);
+  }
+
+  _retireDone() {
+    clearTimeout(this.retireTimer);
+    const ws = this.retiring;
+    this.retiring = null;
+    if (!ws) return;
+    ws.onclose = ws.onerror = ws.onmessage = null;
+    try { ws.close(1000, 'retired'); } catch (_) {}
   }
 
   _onActiveClose(event) {
@@ -290,38 +381,44 @@ class RealtimeTranslator {
       this._status('Switching connection…');
       return;
     }
+    this.ws = null;
     this._scheduleReconnect(event);
   }
 
   _scheduleReconnect(event) {
     const quota = event.code === 1011 && /quota/i.test(event.reason || '');
     if (quota) {
-      this.active = false;
-      this._error(new Error('Gemini quota exceeded — check your plan and billing, then reconnect'));
-      this._status('Disconnected');
+      this._giveUp(new Error('Gemini quota exceeded — check your plan and billing, then reconnect'));
       return;
     }
     if (this.reconnectAttempts >= 6) {
-      this.active = false;
-      this._error(new Error(`Live session lost (${RealtimeTranslator.describeClose(event)})`));
-      this._status('Disconnected');
+      this._giveUp(new Error(`Live session lost (${RealtimeTranslator.describeClose(event)})`));
       return;
     }
     const delay = event.code === 1008 ? 0 : 500 * 2 ** this.reconnectAttempts; // 1008 = routine expiry
     this.reconnectAttempts++;
     this.stats.reconnects++;
     this._status(delay ? `Connection dropped — reconnecting in ${(delay / 1000).toFixed(1)} s` : 'Reconnecting…');
-    setTimeout(async () => {
-      if (!this.active || this.ws) return; // a rollover may have completed meanwhile
+    clearTimeout(this.reconnectTimer);
+    const gen = this.gen;
+    this.reconnectTimer = setTimeout(async () => {
+      if (!this.active || this.ws || this.rollingOver) return; // a rollover may have completed meanwhile
       try {
-        this.ws = await this._openWithFallback();
+        const ws = await this._openWithFallback();
+        if (gen !== this.gen || !this.active || this.ws) { try { ws.close(1000, 'client closed'); } catch (_) {} return; }
+        this.ws = ws;
         this._afterSocketReady();
       } catch (err) {
-        this._error(err);
-        this._status('Disconnected');
-        this.active = false;
+        if (err.cancelled) return;
+        this._giveUp(err);
       }
     }, delay);
+  }
+
+  _giveUp(err) {
+    this.active = false;
+    this._error(err);
+    this._status('Disconnected');
   }
 
   static describeClose(event, fallback = 'connection closed') {
@@ -335,25 +432,39 @@ class RealtimeTranslator {
     }
   }
 
+  /** End the session. Pending transcript lines are delivered first; the resume handle is dropped. */
   close() {
+    if (this.closed) return;
     this.active = false;
+    this.gen++;
+    clearTimeout(this.reconnectTimer); this.reconnectTimer = null;
     clearInterval(this.watchdog); this.watchdog = null;
-    clearTimeout(this.finalizeTimer); this.finalizeTimer = null;
+    this._finalize('close');
+    this._resolveDrain('closed');
     this._flushPlayback();
-    if (this.ws) {
+    for (const ws of [this.ws, this.retiring]) {
+      if (!ws) continue;
       // Detach first: the close event fires asynchronously and must not
       // report status for a session the app has already moved past.
-      this.ws.onopen = this.ws.onmessage = this.ws.onerror = this.ws.onclose = null;
-      try { this.ws.close(1000, 'client closed'); } catch (_) {}
+      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+      try { ws.close(1000, 'client closed'); } catch (_) {}
     }
-    this.ws = null;
+    // The in-flight socket keeps its handlers so its promise settles (as cancelled).
+    if (this.opening) { try { this.opening.close(1000, 'client closed'); } catch (_) {} }
+    clearTimeout(this.retireTimer);
+    this.ws = this.retiring = null;
     this.ready = false;
+    this.resumeHandle = null;
+    this._saveHandle();
     this._status('Disconnected');
+    this.closed = true;
   }
 
   // ---------------------------------------------------------------------------
   // Mid-session configuration: the target language is fixed at setup, but
   // any setting except the model may change when resuming with the handle.
+  // A change while a socket is still connecting is applied by
+  // _afterSocketReady, which compares the setup it sent with current opts.
   // ---------------------------------------------------------------------------
   setTargetLang(code) {
     if (code === this.opts.targetLang) return;
@@ -397,22 +508,55 @@ class RealtimeTranslator {
     this.stats.audioStreamEnds++;
   }
 
+  /**
+   * After the input ended, wait for the translation of what was said to
+   * arrive and finish playing: resolves once a completion (or the silence
+   * finalizer) has fired since the drain began and nothing is still
+   * scheduled — or after ~1.5 s if nothing arrives at all, or at maxMs.
+   */
+  drain({ maxMs = 8000, idleMs = 1500 } = {}) {
+    this._resolveDrain('superseded');
+    if (!this.active || !this.ready) return Promise.resolve('inactive');
+    return new Promise((resolve) => {
+      const d = { resolve, received: false, completed: false };
+      d.timer = setTimeout(() => this._resolveDrain('timeout'), maxMs);
+      d.idleTimer = setTimeout(() => { if (!d.received) this._resolveDrain('idle'); }, idleMs);
+      this.drainState = d;
+    });
+  }
+
+  cancelDrain() { this._resolveDrain('cancelled'); }
+
+  _resolveDrain(why) {
+    const d = this.drainState;
+    if (!d) return;
+    clearTimeout(d.timer); clearTimeout(d.idleTimer);
+    this.drainState = null;
+    d.resolve(why);
+  }
+
+  _checkDrain() {
+    const d = this.drainState;
+    if (!d || !d.completed) return;
+    if (this.scheduled.size === 0 || this.gain.gain.value === 0) this._resolveDrain('done');
+  }
+
   // ---------------------------------------------------------------------------
   // Inbound messages — every key is checked independently because one message
   // can bundle audio, transcripts and completion flags.
   // ---------------------------------------------------------------------------
-  _handle(msg) {
-    if (msg.usageMetadata?.totalTokenCount) {
-      this.usage.tokens = Math.max(this.usage.tokens, msg.usageMetadata.totalTokenCount);
-    }
-    if (msg.sessionResumptionUpdate) {
-      const u = msg.sessionResumptionUpdate;
-      if (u.resumable && u.newHandle) { this.resumeHandle = u.newHandle; this._saveHandle(); }
-    }
-    if (msg.goAway) {
-      const secs = RealtimeTranslator.parseDuration(msg.goAway.timeLeft);
-      this._status(`Server is recycling the connection${secs ? ` in ${Math.round(secs)} s` : ''} — switching over`);
-      this._rollover('server goAway');
+  _handle(msg, fromRetiring = false) {
+    if (msg.usageMetadata?.totalTokenCount) this.usage.tokens += msg.usageMetadata.totalTokenCount;
+    if (!fromRetiring) {
+      if (msg.sessionResumptionUpdate) {
+        const u = msg.sessionResumptionUpdate;
+        if (u.resumable && u.newHandle) { this.resumeHandle = u.newHandle; this._saveHandle(); }
+      }
+      if (msg.goAway) {
+        const secs = RealtimeTranslator.parseDuration(msg.goAway.timeLeft);
+        this._status(`Server is recycling the connection${secs ? ` in ${Math.round(secs)} s` : ''} — switching over`);
+        this._rollover('server goAway', { graceful: true });
+      }
     }
     const sc = msg.serverContent;
     if (!sc) return;
@@ -424,15 +568,20 @@ class RealtimeTranslator {
       if (sc.inputTranscription.languageCode) this.inLang = sc.inputTranscription.languageCode;
       this.opts.onInputText?.(this.inText.trim(), false, this.inLang);
       this._armFinalize();
+      if (this.drainState) this.drainState.received = true;
     }
     if (sc.outputTranscription?.text) {
       this.outText += sc.outputTranscription.text;
       if (sc.outputTranscription.languageCode) this.outLang = sc.outputTranscription.languageCode;
       this.opts.onOutputText?.(this.outText.trim(), false, this.outLang);
       this._armFinalize();
+      if (this.drainState) this.drainState.received = true;
     }
     for (const part of sc.modelTurn?.parts || []) {
-      if (part.inlineData?.data) this._playPcm(part.inlineData.data, part.inlineData.mimeType);
+      if (part.inlineData?.data) {
+        this._playPcm(part.inlineData.data, part.inlineData.mimeType);
+        if (this.drainState) this.drainState.received = true;
+      }
     }
     if (sc.interrupted) this._finalize('interrupted');
     else if (sc.generationComplete) this._finalize('generationComplete');
@@ -448,6 +597,7 @@ class RealtimeTranslator {
   _finalize(by) {
     clearTimeout(this.finalizeTimer); this.finalizeTimer = null;
     const inText = this.inText.trim(), outText = this.outText.trim();
+    if (this.drainState && this.drainState.received) { this.drainState.completed = true; this._checkDrain(); }
     if (!inText && !outText) return;
     this.stats.finalizedBy[by] = (this.stats.finalizedBy[by] || 0) + 1;
     if (inText) this.opts.onInputText?.(inText, true, this.inLang);
@@ -482,7 +632,7 @@ class RealtimeTranslator {
     source.start(startAt);
     this.nextStart = startAt + buffer.duration;
     this.scheduled.add(source);
-    source.onended = () => this.scheduled.delete(source);
+    source.onended = () => { this.scheduled.delete(source); this._checkDrain(); };
     this.stats.audioChunksReceived++;
     this._addUsage(0, buffer.duration);
     if (this.ctx.state === 'suspended') this.ctx.resume();
@@ -514,7 +664,8 @@ class RealtimeTranslator {
   }
 
   // ---------------------------------------------------------------------------
-  // Resume-handle persistence (survives a reload within the 2 h validity)
+  // Resume-handle persistence: survives a page reload (handles are valid for
+  // 2 h); an explicit close() ends the session and drops it.
   // ---------------------------------------------------------------------------
   _handleKey() { return `l10n.rt.handle.${this.model}`; }
 
@@ -533,8 +684,8 @@ class RealtimeTranslator {
     } catch (_) { /* storage unavailable */ }
   }
 
-  _status(text) { this.opts.onStatus?.(text); }
-  _error(err) { this.opts.onError?.(err); }
+  _status(text) { if (!this.closed) this.opts.onStatus?.(text); }
+  _error(err) { if (!this.closed) this.opts.onError?.(err); }
 }
 
 function bytesToBase64(bytes) {
